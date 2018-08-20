@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Anton Tananaev (anton.tananaev@gmail.com)
+ * Copyright 2012 - 2018 Anton Tananaev (anton@traccar.org)
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,125 +15,81 @@
  */
 package org.traccar.protocol;
 
-import java.util.Calendar;
-import java.util.TimeZone;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-import org.jboss.netty.channel.Channel;
-import org.jboss.netty.channel.ChannelHandlerContext;
+import io.netty.channel.Channel;
 import org.traccar.BaseProtocolDecoder;
-import org.traccar.ServerManager;
-import org.traccar.helper.Log;
-import org.traccar.model.ExtendedInfoFormatter;
+import org.traccar.DeviceSession;
+import org.traccar.NetworkMessage;
+import org.traccar.helper.Parser;
+import org.traccar.helper.PatternBuilder;
+import org.traccar.helper.UnitsConverter;
 import org.traccar.model.Position;
+
+import java.net.SocketAddress;
+import java.util.regex.Pattern;
 
 public class Tr20ProtocolDecoder extends BaseProtocolDecoder {
 
-    public Tr20ProtocolDecoder(ServerManager serverManager) {
-        super(serverManager);
+    public Tr20ProtocolDecoder(Tr20Protocol protocol) {
+        super(protocol);
     }
 
-    static private Pattern patternPing = Pattern.compile(
-            "\\%\\%[^,]+,(\\d+)");
+    private static final Pattern PATTERN_PING = new PatternBuilder()
+            .text("%%")
+            .expression("[^,]+,")
+            .number("(d+)")
+            .compile();
 
-    static private Pattern patternData = Pattern.compile(
-            "\\%\\%" +
-            "([^,]+)," +                   // Id
-            "([AL])," +                    // Validity
-            "(\\d{2})(\\d{2})(\\d{2})" +   // Date (YYMMDD)
-            "(\\d{2})(\\d{2})(\\d{2})," +  // Time (HHMMSS)
-            "([NS])" +
-            "(\\d{2})(\\d{2}\\.\\d+)" +    // Latitude (DDMM.MMMM)
-            "([EW])" +
-            "(\\d{3})(\\d{2}\\.\\d+)," +   // Longitude (DDDMM.MMMM)
-            "(\\d+)," +                    // Speed
-            "(\\d+)," +                    // Course
-            ".*");
+    private static final Pattern PATTERN_DATA = new PatternBuilder()
+            .text("%%")
+            .expression("([^,]+),")              // id
+            .expression("([AL]),")               // validity
+            .number("(dd)(dd)(dd)")              // date (yymmdd)
+            .number("(dd)(dd)(dd),")             // time (hhmmss)
+            .expression("([NS])")
+            .number("(dd)(dd.d+)")               // latitude
+            .expression("([EW])")
+            .number("(ddd)(dd.d+),")             // longitude
+            .number("(d+),")                     // speed
+            .number("(d+),")                     // course
+            .any()
+            .compile();
 
     @Override
     protected Object decode(
-            ChannelHandlerContext ctx, Channel channel, Object msg)
-            throws Exception {
+            Channel channel, SocketAddress remoteAddress, Object msg) throws Exception {
 
-        String sentence = (String) msg;
-
-        // Keep alive message
-        Matcher parser = patternPing.matcher(sentence);
+        Parser parser = new Parser(PATTERN_PING, (String) msg);
         if (parser.matches()) {
-
-            // Send response
             if (channel != null) {
-                channel.write("&&" + parser.group(1) + "\r\n");
+                channel.writeAndFlush(new NetworkMessage(
+                        "&&" + parser.next() + "\r\n", remoteAddress)); // keep-alive response
             }
-        } else {
-
-            // Data message parse
-            parser = patternData.matcher(sentence);
-
-            // Unknown message
-            if (!parser.matches()) {
-                return null;
-            }
-
-            // Create new position
-            Position position = new Position();
-            ExtendedInfoFormatter extendedInfo = new ExtendedInfoFormatter("tr20");
-
-            Integer index = 1;
-
-            // Get device by id
-            String id = parser.group(index++);
-            try {
-                position.setDeviceId(getDataManager().getDeviceByImei(id).getId());
-            } catch(Exception error) {
-                Log.warning("Unknown device - " + id);
-                return null;
-            }
-
-            // Validity
-            position.setValid(parser.group(index++).compareTo("A") == 0 ? true : false);
-
-            // Time
-            Calendar time = Calendar.getInstance(TimeZone.getTimeZone("UTC"));
-            time.clear();
-            time.set(Calendar.YEAR, 2000 + Integer.parseInt(parser.group(index++)));
-            time.set(Calendar.MONTH, Integer.parseInt(parser.group(index++)) - 1);
-            time.set(Calendar.DAY_OF_MONTH, Integer.parseInt(parser.group(index++)));
-            time.set(Calendar.HOUR, Integer.parseInt(parser.group(index++)));
-            time.set(Calendar.MINUTE, Integer.parseInt(parser.group(index++)));
-            time.set(Calendar.SECOND, Integer.parseInt(parser.group(index++)));
-            position.setTime(time.getTime());
-
-            // Latitude
-            int hemisphere = 1;
-            if (parser.group(index++).compareTo("S") == 0) hemisphere = -1;
-            Double latitude = Double.valueOf(parser.group(index++));
-            latitude += Double.valueOf(parser.group(index++)) / 60;
-            position.setLatitude(latitude * hemisphere);
-
-            // Longitude
-            hemisphere = 1;
-            if (parser.group(index++).compareTo("W") == 0) hemisphere = -1;
-            Double lonlitude = Double.valueOf(parser.group(index++));
-            lonlitude += Double.valueOf(parser.group(index++)) / 60;
-            position.setLongitude(lonlitude * hemisphere);
-
-            // Speed
-            position.setSpeed(Double.valueOf(parser.group(index++)) * 0.539957);
-
-            // Course
-            position.setCourse(Double.valueOf(parser.group(index++)));
-
-            // Altitude
-            position.setAltitude(0.0);
-
-            // Extended info
-            position.setExtendedInfo(extendedInfo.toString());
-
-            return position;
+            return null;
         }
 
-        return null;
+        parser = new Parser(PATTERN_DATA, (String) msg);
+        if (!parser.matches()) {
+            return null;
+        }
+
+        Position position = new Position(getProtocolName());
+
+        DeviceSession deviceSession = getDeviceSession(channel, remoteAddress, parser.next());
+        if (deviceSession == null) {
+            return null;
+        }
+        position.setDeviceId(deviceSession.getDeviceId());
+
+        position.setValid(parser.next().equals("A"));
+
+        position.setTime(parser.nextDateTime());
+
+        position.setLatitude(parser.nextCoordinate(Parser.CoordinateFormat.HEM_DEG_MIN));
+        position.setLongitude(parser.nextCoordinate(Parser.CoordinateFormat.HEM_DEG_MIN));
+        position.setSpeed(UnitsConverter.knotsFromKph(parser.nextDouble(0)));
+        position.setCourse(parser.nextDouble(0));
+
+        return position;
     }
 
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright 2013 Anton Tananaev (anton.tananaev@gmail.com)
+ * Copyright 2013 - 2018 Anton Tananaev (anton@traccar.org)
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,118 +15,85 @@
  */
 package org.traccar.protocol;
 
-import java.util.Calendar;
-import java.util.TimeZone;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-import org.jboss.netty.channel.Channel;
-import org.jboss.netty.channel.ChannelHandlerContext;
+import io.netty.channel.Channel;
 import org.traccar.BaseProtocolDecoder;
-import org.traccar.ServerManager;
-import org.traccar.helper.Log;
-import org.traccar.model.ExtendedInfoFormatter;
+import org.traccar.DeviceSession;
+import org.traccar.helper.DateBuilder;
+import org.traccar.helper.Parser;
+import org.traccar.helper.PatternBuilder;
 import org.traccar.model.Position;
+
+import java.net.SocketAddress;
+import java.util.regex.Pattern;
 
 public class CarscopProtocolDecoder extends BaseProtocolDecoder {
 
-    private Long deviceId;
-
-    public CarscopProtocolDecoder(ServerManager serverManager) {
-        super(serverManager);
+    public CarscopProtocolDecoder(CarscopProtocol protocol) {
+        super(protocol);
     }
 
-    // Very similar to TK103 protocol
-    static private Pattern pattern = Pattern.compile(
-            "\\*.*" +
-            "(\\d{2})(\\d{2})(\\d{2})" + // Time (HHMMSS)
-            "([AV])" +                   // Validity
-            "(\\d{2})(\\d{2}\\.\\d{4})" + // Latitude (DDMM.MMMM)
-            "([NS])" +
-            "(\\d{3})(\\d{2}\\.\\d{4})" + // Longitude (DDDMM.MMMM)
-            "([EW])" +
-            "(\\d{3}\\.\\d)" +           // Speed
-            "(\\d{2})(\\d{2})(\\d{2})" + // Date (YYMMDD)
-            "(\\d{3}\\.\\d{2})" +        // Course
-            "(\\d{8})" +                 // State
-            "L(\\d{6})");                // Milage
+    private static final Pattern PATTERN = new PatternBuilder()
+            .text("*")
+            .any()
+            .number("(dd)(dd)(dd)")              // time (hhmmss)
+            .expression("([AV])")                // validity
+            .number("(dd)(dd.dddd)")             // latitude
+            .expression("([NS])")
+            .number("(ddd)(dd.dddd)")            // longitude
+            .expression("([EW])")
+            .number("(ddd.d)")                   // speed
+            .number("(dd)(dd)(dd)")              // date (yymmdd)
+            .number("(ddd.dd)")                  // course
+            .groupBegin()
+            .number("(d{8})")                    // state
+            .number("L(d{6})")                   // odometer
+            .groupEnd("?")
+            .compile();
 
     @Override
     protected Object decode(
-            ChannelHandlerContext ctx, Channel channel, Object msg)
-            throws Exception {
+            Channel channel, SocketAddress remoteAddress, Object msg) throws Exception {
 
         String sentence = (String) msg;
 
-        // Device identification
+        DeviceSession deviceSession;
         int index = sentence.indexOf("UB05");
         if (index != -1) {
             String imei = sentence.substring(index + 4, index + 4 + 15);
-            try {
-                deviceId = getDataManager().getDeviceByImei(imei).getId();
-            } catch(Exception error) {
-                Log.warning("Unknown device - " + imei);
-            }
+            deviceSession = getDeviceSession(channel, remoteAddress, imei);
+        } else {
+            deviceSession = getDeviceSession(channel, remoteAddress);
         }
-        if (deviceId == null) {
+        if (deviceSession == null) {
             return null;
         }
 
-        // Parse message
-        Matcher parser = pattern.matcher(sentence);
+        Parser parser = new Parser(PATTERN, sentence);
         if (!parser.matches()) {
             return null;
         }
 
-        // Create new position
-        Position position = new Position();
-        position.setDeviceId(deviceId);
-        ExtendedInfoFormatter extendedInfo = new ExtendedInfoFormatter("carscop");
-        index = 1;
+        Position position = new Position(getProtocolName());
+        position.setDeviceId(deviceSession.getDeviceId());
 
-        // Time
-        Calendar time = Calendar.getInstance(TimeZone.getTimeZone("UTC"));
-        time.clear();
-        time.set(Calendar.HOUR, Integer.valueOf(parser.group(index++)));
-        time.set(Calendar.MINUTE, Integer.valueOf(parser.group(index++)));
-        time.set(Calendar.SECOND, Integer.valueOf(parser.group(index++)));
+        DateBuilder dateBuilder = new DateBuilder()
+                .setTime(parser.nextInt(0), parser.nextInt(0), parser.nextInt(0));
 
-        // Validity
-        position.setValid(parser.group(index++).compareTo("A") == 0 ? true : false);
+        position.setValid(parser.next().equals("A"));
+        position.setLatitude(parser.nextCoordinate());
+        position.setLongitude(parser.nextCoordinate());
+        position.setSpeed(parser.nextDouble(0));
 
-        // Latitude
-        Double latitude = Double.valueOf(parser.group(index++));
-        latitude += Double.valueOf(parser.group(index++)) / 60;
-        if (parser.group(index++).compareTo("S") == 0) latitude = -latitude;
-        position.setLatitude(latitude);
+        dateBuilder.setDate(parser.nextInt(0), parser.nextInt(0), parser.nextInt(0));
+        position.setTime(dateBuilder.getDate());
 
-        // Longitude
-        Double lonlitude = Double.valueOf(parser.group(index++));
-        lonlitude += Double.valueOf(parser.group(index++)) / 60;
-        if (parser.group(index++).compareTo("W") == 0) lonlitude = -lonlitude;
-        position.setLongitude(lonlitude);
+        position.setCourse(parser.nextDouble(0));
 
-        // Altitude
-        position.setAltitude(0.0);
+        if (parser.hasNext(2)) {
+            position.set(Position.KEY_STATUS, parser.next());
+            position.set(Position.KEY_ODOMETER, parser.nextInt(0));
+        }
 
-        // Speed
-        position.setSpeed(Double.valueOf(parser.group(index++)));
-
-        // Date
-        time.set(Calendar.YEAR, 2000 + Integer.valueOf(parser.group(index++)));
-        time.set(Calendar.MONTH, Integer.valueOf(parser.group(index++)) - 1);
-        time.set(Calendar.DAY_OF_MONTH, Integer.valueOf(parser.group(index++)));
-        position.setTime(time.getTime());
-
-        // Course
-        position.setCourse(Double.valueOf(parser.group(index++)));
-        
-        // State
-        extendedInfo.set("state", parser.group(index++));
-
-        // Milage
-        extendedInfo.set("milage", Integer.valueOf(parser.group(index++)));
-
-        position.setExtendedInfo(extendedInfo.toString());
         return position;
     }
 

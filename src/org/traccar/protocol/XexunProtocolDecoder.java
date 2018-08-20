@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 - 2013 Anton Tananaev (anton.tananaev@gmail.com)
+ * Copyright 2012 - 2018 Anton Tananaev (anton@traccar.org)
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,109 +15,134 @@
  */
 package org.traccar.protocol;
 
-import java.text.ParseException;
-import java.util.Calendar;
-import java.util.TimeZone;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-import org.jboss.netty.channel.Channel;
-import org.jboss.netty.channel.ChannelHandlerContext;
+import io.netty.channel.Channel;
 import org.traccar.BaseProtocolDecoder;
-import org.traccar.ServerManager;
-import org.traccar.helper.Log;
+import org.traccar.DeviceSession;
+import org.traccar.helper.DateBuilder;
+import org.traccar.helper.Parser;
+import org.traccar.helper.PatternBuilder;
 import org.traccar.model.Position;
+
+import java.net.SocketAddress;
+import java.util.regex.Pattern;
 
 public class XexunProtocolDecoder extends BaseProtocolDecoder {
 
-    public XexunProtocolDecoder(ServerManager serverManager) {
-        super(serverManager);
+    private final boolean full;
+
+    public XexunProtocolDecoder(XexunProtocol protocol, boolean full) {
+        super(protocol);
+        this.full = full;
     }
 
-    /**
-     * Regular expressions pattern
-     */
-    //GPRMC,043435.000,A,811.299200,S,11339.9500,E,0.93,29.52,160313,00,0000.0,A*65,F,,imei:359585014597923,
-    static private Pattern pattern = Pattern.compile(
-            "GPRMC," +
-            "(\\d{2})(\\d{2})(\\d{2}).(\\d{3})," + // Time (HHMMSS.SSS)
-            "([AV])," +                         // Validity
-            "(\\d+)(\\d{2}\\.\\d+)," +          // Latitude (DDMM.MMMM)
-            "([NS])," +
-            "(\\d+)(\\d{2}\\.\\d+)," +          // Longitude (DDDMM.MMMM)
-            "([EW])," +
-            "(\\d+\\.\\d+)," +                  // Speed
-            "(\\d+\\.\\d+)?," +                 // Course
-            "(\\d{2})(\\d{2})(\\d{2})," +       // Date (DDMMYY)
-            ".*imei:" +
-            "(\\d+),");                         // IMEI
+    private static final Pattern PATTERN_BASIC = new PatternBuilder()
+            .expression("G[PN]RMC,")
+            .number("(?:(dd)(dd)(dd))?.?d*,")    // time (hhmmss)
+            .expression("([AV]),")               // validity
+            .number("(d*?)(d?d.d+),([NS]),")     // latitude
+            .number("(d*?)(d?d.d+),([EW])?,")    // longitude
+            .number("(d+.?d*),")                 // speed
+            .number("(d+.?d*)?,")                // course
+            .number("(?:(dd)(dd)(dd))?,")        // date (ddmmyy)
+            .expression("[^*]*").text("*")
+            .number("xx")                        // checksum
+            .expression("\\r\\n").optional()
+            .expression(",([FL]),")              // signal
+            .expression("([^,]*),").optional()   // alarm
+            .any()
+            .number("imei:(d+),")                // imei
+            .compile();
+
+    private static final Pattern PATTERN_FULL = new PatternBuilder()
+            .any()
+            .number("(d+),")                     // serial
+            .expression("([^,]+)?,")             // phone number
+            .expression(PATTERN_BASIC.pattern())
+            .number("(d+),")                     // satellites
+            .number("(-?d+.d+)?,")               // altitude
+            .number("[FL]:(d+.d+)V")             // power
+            .any()
+            .compile();
+
+    private String decodeStatus(Position position, String value) {
+        if (value != null) {
+            switch (value.toLowerCase()) {
+                case "acc on":
+                case "accstart":
+                    position.set(Position.KEY_IGNITION, true);
+                    break;
+                case "acc off":
+                case "accstop":
+                    position.set(Position.KEY_IGNITION, false);
+                    break;
+                case "help me!":
+                    position.set(Position.KEY_ALARM, Position.ALARM_SOS);
+                    break;
+                case "low battery":
+                    position.set(Position.KEY_ALARM, Position.ALARM_LOW_BATTERY);
+                    break;
+                case "move!":
+                case "moved!":
+                    position.set(Position.KEY_ALARM, Position.ALARM_MOVEMENT);
+                    break;
+                default:
+                    break;
+            }
+        }
+        return null;
+    }
 
     @Override
     protected Object decode(
-            ChannelHandlerContext ctx, Channel channel, Object msg)
-            throws Exception {
+            Channel channel, SocketAddress remoteAddress, Object msg) throws Exception {
 
-        // Parse message
-        String sentence = (String) msg;
-        Matcher parser = pattern.matcher(sentence);
+        Pattern pattern = PATTERN_BASIC;
+        if (full) {
+            pattern = PATTERN_FULL;
+        }
+
+        Parser parser = new Parser(pattern, (String) msg);
         if (!parser.matches()) {
-            throw new ParseException(null, 0);
-        }
-
-        // Create new position
-        Position position = new Position();
-
-        Integer index = 1;
-
-        // Time
-        Calendar time = Calendar.getInstance(TimeZone.getTimeZone("UTC"));
-        time.clear();
-        time.set(Calendar.HOUR, Integer.valueOf(parser.group(index++)));
-        time.set(Calendar.MINUTE, Integer.valueOf(parser.group(index++)));
-        time.set(Calendar.SECOND, Integer.valueOf(parser.group(index++)));
-        time.set(Calendar.MILLISECOND, Integer.valueOf(parser.group(index++)));
-
-        // Validity
-        position.setValid(parser.group(index++).compareTo("A") == 0 ? true : false);
-
-        // Latitude
-        Double latitude = Double.valueOf(parser.group(index++));
-        latitude += Double.valueOf(parser.group(index++)) / 60;
-        if (parser.group(index++).compareTo("S") == 0) latitude = -latitude;
-        position.setLatitude(latitude);
-
-        // Longitude
-        Double lonlitude = Double.valueOf(parser.group(index++));
-        lonlitude += Double.valueOf(parser.group(index++)) / 60;
-        if (parser.group(index++).compareTo("W") == 0) lonlitude = -lonlitude;
-        position.setLongitude(lonlitude);
-
-        // Altitude
-        position.setAltitude(0.0);
-
-        // Speed
-        position.setSpeed(Double.valueOf(parser.group(index++)));
-
-        // Course
-        String course = parser.group(index++);
-        if (course != null) {
-            position.setCourse(Double.valueOf(course));
-        } else {
-            position.setCourse(0.0);
-        }
-
-        // Date
-        time.set(Calendar.DAY_OF_MONTH, Integer.valueOf(parser.group(index++)));
-        time.set(Calendar.MONTH, Integer.valueOf(parser.group(index++)) - 1);
-        time.set(Calendar.YEAR, 2000 + Integer.valueOf(parser.group(index++)));
-        position.setTime(time.getTime());
-
-        // Get device by IMEI
-        String imei = parser.group(index++);
-        try {
-            position.setDeviceId(getDataManager().getDeviceByImei(imei).getId());
-        } catch(Exception error) {
-            Log.warning("Unknown device - " + imei);
             return null;
+        }
+
+        Position position = new Position(getProtocolName());
+
+        if (full) {
+            position.set("serial", parser.next());
+            position.set("number", parser.next());
+        }
+
+        DateBuilder dateBuilder = new DateBuilder()
+                .setTime(parser.nextInt(0), parser.nextInt(0), parser.nextInt(0));
+
+        position.setValid(parser.next().equals("A"));
+        position.setLatitude(parser.nextCoordinate());
+        position.setLongitude(parser.nextCoordinate());
+
+        position.setSpeed(convertSpeed(parser.nextDouble(0), "kn"));
+
+        position.setCourse(parser.nextDouble(0));
+
+        dateBuilder.setDateReverse(parser.nextInt(0), parser.nextInt(0), parser.nextInt(0));
+        position.setTime(dateBuilder.getDate());
+
+        position.set("signal", parser.next());
+
+        decodeStatus(position, parser.next());
+
+        DeviceSession deviceSession = getDeviceSession(channel, remoteAddress, parser.next());
+        if (deviceSession == null) {
+            return null;
+        }
+        position.setDeviceId(deviceSession.getDeviceId());
+
+        if (full) {
+            position.set(Position.KEY_SATELLITES, parser.nextInt());
+
+            position.setAltitude(parser.nextDouble(0));
+
+            position.set(Position.KEY_POWER, parser.nextDouble(0));
         }
 
         return position;

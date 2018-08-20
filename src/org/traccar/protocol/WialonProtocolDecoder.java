@@ -1,5 +1,5 @@
 /*
- * Copyright 2013 Anton Tananaev (anton.tananaev@gmail.com)
+ * Copyright 2013 - 2018 Anton Tananaev (anton@traccar.org)
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,134 +15,178 @@
  */
 package org.traccar.protocol;
 
-import java.util.Calendar;
-import java.util.TimeZone;
+import io.netty.channel.Channel;
+import org.traccar.BaseProtocolDecoder;
+import org.traccar.DeviceSession;
+import org.traccar.NetworkMessage;
+import org.traccar.helper.Parser;
+import org.traccar.helper.PatternBuilder;
+import org.traccar.helper.UnitsConverter;
+import org.traccar.model.Position;
+
+import java.net.SocketAddress;
+import java.util.Date;
+import java.util.LinkedList;
+import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import org.jboss.netty.channel.Channel;
-import org.jboss.netty.channel.ChannelHandlerContext;
-import org.traccar.BaseProtocolDecoder;
-import org.traccar.ServerManager;
-import org.traccar.helper.Log;
-import org.traccar.model.ExtendedInfoFormatter;
-import org.traccar.model.Position;
 
 public class WialonProtocolDecoder extends BaseProtocolDecoder {
 
-    private Long deviceId;
-
-    public WialonProtocolDecoder(ServerManager serverManager) {
-        super(serverManager);
+    public WialonProtocolDecoder(WialonProtocol protocol) {
+        super(protocol);
     }
 
-    static private Pattern pattern = Pattern.compile(
-            "#S?D#" +
-            "(\\d{2})(\\d{2})(\\d{2});" +  // Date (DDMMYY)
-            "(\\d{2})(\\d{2})(\\d{2});" +  // Time (HHMMSS)
-            "(\\d{2})(\\d{2}\\.\\d+);" +   // Latitude (DDMM.MMMM)
-            "([NS]);" +
-            "(\\d{3})(\\d{2}\\.\\d+);" +   // Longitude (DDDMM.MMMM)
-            "([EW]);" +
-            "(\\d+);" +                    // Speed
-            "(\\d+);" +                    // Course
-            "(\\d+);" +                    // Altitude
-            "(\\d+)" +                     // Satellites
-            ".*");                         // Full format
+    private static final Pattern PATTERN = new PatternBuilder()
+            .number("(dd)(dd)(dd);")             // date (ddmmyy)
+            .number("(dd)(dd)(dd);")             // time (hhmmss)
+            .number("(dd)(dd.d+);")              // latitude
+            .expression("([NS]);")
+            .number("(ddd)(dd.d+);")             // longitude
+            .expression("([EW]);")
+            .number("(d+.?d*)?;")                // speed
+            .number("(d+.?d*)?;")                // course
+            .number("(?:NA|(d+.?d*));")          // altitude
+            .number("(?:NA|(d+))")               // satellites
+            .groupBegin().text(";")
+            .number("(?:NA|(d+.?d*));")          // hdop
+            .number("(?:NA|(d+));")              // inputs
+            .number("(?:NA|(d+));")              // outputs
+            .expression("(?:NA|([^;]*));")       // adc
+            .expression("(?:NA|([^;]*));")       // ibutton
+            .expression("(?:NA|(.*))")           // params
+            .groupEnd("?")
+            .compile();
 
-    private void sendResponse(Channel channel, String prefix, Integer number) {
+    private void sendResponse(Channel channel, SocketAddress remoteAddress, String prefix, Integer number) {
         if (channel != null) {
             StringBuilder response = new StringBuilder(prefix);
             if (number != null) {
                 response.append(number);
             }
             response.append("\r\n");
-            channel.write(response.toString());
+            channel.writeAndFlush(new NetworkMessage(response.toString(), remoteAddress));
         }
+    }
+
+    private Position decodePosition(Channel channel, SocketAddress remoteAddress, String substring) {
+
+        DeviceSession deviceSession = getDeviceSession(channel, remoteAddress);
+        if (deviceSession == null) {
+            return null;
+        }
+
+        Parser parser = new Parser(PATTERN, substring);
+        if (!parser.matches()) {
+            return null;
+        }
+
+        Position position = new Position(getProtocolName());
+        position.setDeviceId(deviceSession.getDeviceId());
+
+        position.setTime(parser.nextDateTime(Parser.DateTimeFormat.DMY_HMS));
+
+        position.setLatitude(parser.nextCoordinate());
+        position.setLongitude(parser.nextCoordinate());
+        position.setSpeed(UnitsConverter.knotsFromKph(parser.nextDouble(0)));
+        position.setCourse(parser.nextDouble(0));
+        position.setAltitude(parser.nextDouble(0));
+
+        if (parser.hasNext()) {
+            int satellites = parser.nextInt(0);
+            position.setValid(satellites >= 3);
+            position.set(Position.KEY_SATELLITES, satellites);
+        }
+
+        position.set(Position.KEY_HDOP, parser.nextDouble());
+        position.set(Position.KEY_INPUT, parser.next());
+        position.set(Position.KEY_OUTPUT, parser.next());
+
+        if (parser.hasNext()) {
+            String[] values = parser.next().split(",");
+            for (int i = 0; i < values.length; i++) {
+                position.set(Position.PREFIX_ADC + (i + 1), values[i]);
+            }
+        }
+
+        position.set(Position.KEY_DRIVER_UNIQUE_ID, parser.next());
+
+        if (parser.hasNext()) {
+            String[] values = parser.next().split(",");
+            for (String param : values) {
+                Matcher paramParser = Pattern.compile("(.*):[1-3]:(.*)").matcher(param);
+                if (paramParser.matches()) {
+                    try {
+                        position.set(paramParser.group(1).toLowerCase(), Double.parseDouble(paramParser.group(2)));
+                    } catch (NumberFormatException e) {
+                        position.set(paramParser.group(1).toLowerCase(), paramParser.group(2));
+                    }
+                }
+            }
+        }
+
+        return position;
     }
 
     @Override
     protected Object decode(
-            ChannelHandlerContext ctx, Channel channel, Object msg)
-            throws Exception {
+            Channel channel, SocketAddress remoteAddress, Object msg) throws Exception {
 
         String sentence = (String) msg;
 
-        // Detect device ID
         if (sentence.startsWith("#L#")) {
-            String imei = sentence.substring(3, sentence.indexOf(';'));
-            try {
-                deviceId = getDataManager().getDeviceByImei(imei).getId();
-                sendResponse(channel, "#AL#", 1);
-            } catch(Exception error) {
-                Log.warning("Unknown device - " + imei);
-            }
-        }
 
-        // Heartbeat
-        else if (sentence.startsWith("#P#")) {
-            sendResponse(channel, "#AP#", null);
-        }
-        
-        // Parse message
-        else if ((sentence.startsWith("#SD#") || sentence.startsWith("#D#")) && deviceId != null) {
+            String[] values = sentence.substring(3).split(";");
 
-            // Parse message
-            Matcher parser = pattern.matcher(sentence);
-            if (!parser.matches()) {
-                return null;
+            String imei = values[0].indexOf('.') >= 0 ? values[1] : values[0];
+            DeviceSession deviceSession = getDeviceSession(channel, remoteAddress, imei);
+            if (deviceSession != null) {
+                sendResponse(channel, remoteAddress, "#AL#", 1);
             }
 
-            // Create new position
-            Position position = new Position();
-            ExtendedInfoFormatter extendedInfo = new ExtendedInfoFormatter("wialon");
-            position.setDeviceId(deviceId);
+        } else if (sentence.startsWith("#P#")) {
 
-            Integer index = 1;
+            sendResponse(channel, remoteAddress, "#AP#", null); // heartbeat
 
-            // Date and Time
-            Calendar time = Calendar.getInstance(TimeZone.getTimeZone("UTC"));
-            time.clear();
-            time.set(Calendar.DAY_OF_MONTH, Integer.valueOf(parser.group(index++)));
-            time.set(Calendar.MONTH, Integer.valueOf(parser.group(index++)) - 1);
-            time.set(Calendar.YEAR, 2000 + Integer.valueOf(parser.group(index++)));
-            time.set(Calendar.HOUR, Integer.valueOf(parser.group(index++)));
-            time.set(Calendar.MINUTE, Integer.valueOf(parser.group(index++)));
-            time.set(Calendar.SECOND, Integer.valueOf(parser.group(index++)));
-            position.setTime(time.getTime());
+        } else if (sentence.startsWith("#SD#") || sentence.startsWith("#D#")) {
 
-            // Latitude
-            Double latitude = Double.valueOf(parser.group(index++));
-            latitude += Double.valueOf(parser.group(index++)) / 60;
-            if (parser.group(index++).compareTo("S") == 0) latitude = -latitude;
-            position.setLatitude(latitude);
+            Position position = decodePosition(
+                    channel, remoteAddress, sentence.substring(sentence.indexOf('#', 1) + 1));
 
-            // Longitude
-            Double lonlitude = Double.valueOf(parser.group(index++));
-            lonlitude += Double.valueOf(parser.group(index++)) / 60;
-            if (parser.group(index++).compareTo("W") == 0) lonlitude = -lonlitude;
-            position.setLongitude(lonlitude);
+            if (position != null) {
+                sendResponse(channel, remoteAddress, "#AD#", 1);
+                return position;
+            }
 
-            // Speed
-            position.setSpeed(Double.valueOf(parser.group(index++)));
+        } else if (sentence.startsWith("#B#")) {
 
-            // Course
-            position.setCourse(Double.valueOf(parser.group(index++)));
+            String[] messages = sentence.substring(sentence.indexOf('#', 1) + 1).split("\\|");
+            List<Position> positions = new LinkedList<>();
 
-            // Altitude
-            position.setAltitude(Double.valueOf(parser.group(index++)));
-            
-            // Satellites
-            int satellites = Integer.valueOf(parser.group(index++));
-            position.setValid(satellites >= 3);
-            extendedInfo.set("satellites", satellites);
-            
-            // Extended info
-            position.setExtendedInfo(extendedInfo.toString());
+            for (String message : messages) {
+                Position position = decodePosition(channel, remoteAddress, message);
+                if (position != null) {
+                    position.set(Position.KEY_ARCHIVE, true);
+                    positions.add(position);
+                }
+            }
 
-            // Send response
-            sendResponse(channel, "#AD#", 1);
+            sendResponse(channel, remoteAddress, "#AB#", messages.length);
+            if (!positions.isEmpty()) {
+                return positions;
+            }
 
-            return position;
+        } else if (sentence.startsWith("#M#")) {
+            DeviceSession deviceSession = getDeviceSession(channel, remoteAddress);
+            if (deviceSession != null) {
+                Position position = new Position(getProtocolName());
+                position.setDeviceId(deviceSession.getDeviceId());
+                getLastLocation(position, new Date());
+                position.setValid(false);
+                position.set(Position.KEY_RESULT, sentence.substring(sentence.indexOf('#', 1) + 1));
+                sendResponse(channel, remoteAddress, "#AM#", 1);
+                return position;
+            }
         }
 
         return null;

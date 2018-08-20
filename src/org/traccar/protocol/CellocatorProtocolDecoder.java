@@ -1,5 +1,5 @@
 /*
- * Copyright 2013 Anton Tananaev (anton.tananaev@gmail.com)
+ * Copyright 2013 - 2018 Anton Tananaev (anton@traccar.org)
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,153 +15,141 @@
  */
 package org.traccar.protocol;
 
-import java.nio.ByteOrder;
-import java.util.Calendar;
-import java.util.TimeZone;
-import org.jboss.netty.buffer.ChannelBuffer;
-import org.jboss.netty.buffer.ChannelBuffers;
-import org.jboss.netty.channel.Channel;
-import org.jboss.netty.channel.ChannelHandlerContext;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.Channel;
 import org.traccar.BaseProtocolDecoder;
-import org.traccar.ServerManager;
-import org.traccar.helper.Log;
-import org.traccar.model.ExtendedInfoFormatter;
+import org.traccar.DeviceSession;
+import org.traccar.NetworkMessage;
+import org.traccar.helper.DateBuilder;
+import org.traccar.helper.UnitsConverter;
 import org.traccar.model.Position;
+
+import java.net.SocketAddress;
 
 public class CellocatorProtocolDecoder extends BaseProtocolDecoder {
 
-    public CellocatorProtocolDecoder(ServerManager serverManager) {
-        super(serverManager);
+    public CellocatorProtocolDecoder(CellocatorProtocol protocol) {
+        super(protocol);
     }
 
-    private String readImei(ChannelBuffer buf) {
-        int b = buf.readUnsignedByte();
-        StringBuilder imei = new StringBuilder();
-        imei.append(b & 0x0F);
-        for (int i = 0; i < 7; i++) {
-            b = buf.readUnsignedByte();
-            imei.append((b & 0xF0) >> 4);
-            imei.append(b & 0x0F);
-        }
-        return imei.toString();
-    }
-    
     static final int MSG_CLIENT_STATUS = 0;
     static final int MSG_CLIENT_PROGRAMMING = 3;
     static final int MSG_CLIENT_SERIAL_LOG = 7;
     static final int MSG_CLIENT_SERIAL = 8;
     static final int MSG_CLIENT_MODULAR = 9;
 
-    private static final int MSG_SERVER_ACKNOWLEDGE = 4;
-    
+    public static final int MSG_SERVER_ACKNOWLEDGE = 4;
+
     private byte commandCount;
-    
-    private void sendReply(Channel channel, long deviceId, byte packetNumber) {
-        ChannelBuffer reply = ChannelBuffers.directBuffer(ByteOrder.LITTLE_ENDIAN, 28);
-        reply.writeByte('M');
-        reply.writeByte('C');
-        reply.writeByte('G');
-        reply.writeByte('P');
-        reply.writeByte(MSG_SERVER_ACKNOWLEDGE);
-        reply.writeInt((int) deviceId);
-        reply.writeByte(commandCount++);
-        reply.writeInt(0); // authentication code
-        reply.writeByte(0);
-        reply.writeByte(packetNumber);
-        reply.writeZero(10);
 
-        byte checksum = 0;
-        for (int i = 4; i < 27; i++) {
-            checksum += reply.getByte(i);
-        }
-        reply.writeByte(checksum);
-
+    private void sendReply(Channel channel, SocketAddress remoteAddress, long deviceId, byte packetNumber) {
         if (channel != null) {
-            channel.write(reply);
+            ByteBuf reply = Unpooled.buffer(28);
+            reply.writeByte('M');
+            reply.writeByte('C');
+            reply.writeByte('G');
+            reply.writeByte('P');
+            reply.writeByte(MSG_SERVER_ACKNOWLEDGE);
+            reply.writeIntLE((int) deviceId);
+            reply.writeByte(commandCount++);
+            reply.writeIntLE(0); // authentication code
+            reply.writeByte(0);
+            reply.writeByte(packetNumber);
+            reply.writeZero(11);
+
+            byte checksum = 0;
+            for (int i = 4; i < 27; i++) {
+                checksum += reply.getByte(i);
+            }
+            reply.writeByte(checksum);
+
+            channel.writeAndFlush(new NetworkMessage(reply, remoteAddress));
         }
     }
-    
+
+    private String decodeAlarm(short reason) {
+        switch (reason) {
+            case 70:
+                return Position.ALARM_SOS;
+            case 80:
+                return Position.ALARM_POWER_CUT;
+            case 81:
+                return Position.ALARM_LOW_POWER;
+            default:
+                return null;
+        }
+    }
+
     @Override
     protected Object decode(
-            ChannelHandlerContext ctx, Channel channel, Object msg)
-            throws Exception {
+            Channel channel, SocketAddress remoteAddress, Object msg) throws Exception {
 
-        ChannelBuffer buf = (ChannelBuffer) msg;
+        ByteBuf buf = (ByteBuf) msg;
 
         buf.skipBytes(4); // system code
         int type = buf.readUnsignedByte();
-        long deviceId = buf.readUnsignedInt();
-        
+        long deviceUniqueId = buf.readUnsignedIntLE();
+
         if (type != MSG_CLIENT_SERIAL) {
-            buf.readUnsignedShort(); // communication control
+            buf.readUnsignedShortLE(); // communication control
         }
         byte packetNumber = buf.readByte();
 
-        // Send reply
-        sendReply(channel, deviceId, packetNumber);
+        sendReply(channel, remoteAddress, deviceUniqueId, packetNumber);
 
-        // Parse location
         if (type == MSG_CLIENT_STATUS) {
-            Position position = new Position();
-            ExtendedInfoFormatter extendedInfo = new ExtendedInfoFormatter("cellocator");
-            
-            // Device identifier
-            try {
-                position.setDeviceId(getDataManager().getDeviceByImei(String.valueOf(deviceId)).getId());
-            } catch(Exception error) {
-                Log.warning("Unknown device - " + deviceId);
+
+            Position position = new Position(getProtocolName());
+
+            DeviceSession deviceSession = getDeviceSession(channel, remoteAddress, String.valueOf(deviceUniqueId));
+            if (deviceSession == null) {
                 return null;
             }
-            
-            buf.readUnsignedByte(); // hardware version
-            buf.readUnsignedByte(); // software version
-            buf.readUnsignedByte(); // protocol version
+            position.setDeviceId(deviceSession.getDeviceId());
 
-            // Status
-            extendedInfo.set("status", buf.getUnsignedByte(buf.readerIndex()) & 0x0f);
-            
+            position.set(Position.KEY_VERSION_HW, buf.readUnsignedByte());
+            position.set(Position.KEY_VERSION_FW, buf.readUnsignedByte());
+            position.set("protocolVersion", buf.readUnsignedByte());
+
+            position.set(Position.KEY_STATUS, buf.getUnsignedByte(buf.readerIndex()) & 0x0f);
+
             int operator = (buf.readUnsignedByte() & 0xf0) << 4;
             operator += buf.readUnsignedByte();
-            
+
             buf.readUnsignedByte(); // reason data
-            buf.readUnsignedByte(); // reason
-            buf.readUnsignedByte(); // mode
-            buf.readUnsignedInt(); // IO
-            
+            position.set(Position.KEY_ALARM, decodeAlarm(buf.readUnsignedByte()));
+
+            position.set("mode", buf.readUnsignedByte());
+            position.set(Position.PREFIX_IO + 1, buf.readUnsignedIntLE());
+
             operator <<= 8;
             operator += buf.readUnsignedByte();
-            extendedInfo.set("operator", operator);
-            
-            buf.readUnsignedInt(); // ADC
-            buf.readUnsignedMedium(); // milage
+            position.set(Position.KEY_OPERATOR, operator);
+
+            position.set(Position.PREFIX_ADC + 1, buf.readUnsignedIntLE());
+            position.set(Position.KEY_ODOMETER, buf.readUnsignedMediumLE());
             buf.skipBytes(6); // multi-purpose data
-            
-            buf.readUnsignedShort(); // gps fix
-            buf.readUnsignedByte(); // location status
-            buf.readUnsignedByte(); // mode 1
-            buf.readUnsignedByte(); // mode 2
 
-            position.setValid(buf.readUnsignedByte() >= 3); // satellites
+            position.set(Position.KEY_GPS, buf.readUnsignedShortLE());
+            position.set("locationStatus", buf.readUnsignedByte());
+            position.set("mode1", buf.readUnsignedByte());
+            position.set("mode2", buf.readUnsignedByte());
 
-            // Location data
-            position.setLongitude(buf.readInt() / Math.PI * 180 / 100000000);
-            position.setLatitude(buf.readInt() / Math.PI * 180 / 100000000.0);
-            position.setAltitude(buf.readInt() * 0.01);
-            position.setSpeed(buf.readInt() * 0.01 * 1.943844);
-            position.setCourse(buf.readUnsignedShort() / Math.PI * 180.0 / 1000.0);
-            
-            // Time
-            Calendar time = Calendar.getInstance(TimeZone.getTimeZone("UTC"));
-            time.clear();
-            time.set(Calendar.SECOND, buf.readUnsignedByte());
-            time.set(Calendar.MINUTE, buf.readUnsignedByte());
-            time.set(Calendar.HOUR, buf.readUnsignedByte());
-            time.set(Calendar.DAY_OF_MONTH, buf.readUnsignedByte());
-            time.set(Calendar.MONTH, buf.readUnsignedByte() - 1);
-            time.set(Calendar.YEAR, buf.readUnsignedShort());
-            position.setTime(time.getTime());
+            position.set(Position.KEY_SATELLITES, buf.readUnsignedByte());
 
-            position.setExtendedInfo(extendedInfo.toString());
+            position.setValid(true);
+            position.setLongitude(buf.readIntLE() / Math.PI * 180 / 100000000);
+            position.setLatitude(buf.readIntLE() / Math.PI * 180 / 100000000.0);
+            position.setAltitude(buf.readIntLE() * 0.01);
+            position.setSpeed(UnitsConverter.knotsFromMps(buf.readIntLE() * 0.01));
+            position.setCourse(buf.readUnsignedShortLE() / Math.PI * 180.0 / 1000.0);
+
+            DateBuilder dateBuilder = new DateBuilder()
+                    .setTimeReverse(buf.readUnsignedByte(), buf.readUnsignedByte(), buf.readUnsignedByte())
+                    .setDateReverse(buf.readUnsignedByte(), buf.readUnsignedByte(), buf.readUnsignedShortLE());
+            position.setTime(dateBuilder.getDate());
+
             return position;
         }
 

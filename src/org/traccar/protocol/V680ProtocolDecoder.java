@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 - 2013 Anton Tananaev (anton.tananaev@gmail.com)
+ * Copyright 2012 - 2018 Anton Tananaev (anton@traccar.org)
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,146 +15,116 @@
  */
 package org.traccar.protocol;
 
-import java.util.Calendar;
-import java.util.TimeZone;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-import org.jboss.netty.channel.Channel;
-import org.jboss.netty.channel.ChannelHandlerContext;
+import io.netty.channel.Channel;
 import org.traccar.BaseProtocolDecoder;
-import org.traccar.ServerManager;
-import org.traccar.helper.Log;
-import org.traccar.model.ExtendedInfoFormatter;
+import org.traccar.DeviceSession;
+import org.traccar.helper.DateBuilder;
+import org.traccar.helper.Parser;
+import org.traccar.helper.PatternBuilder;
 import org.traccar.model.Position;
+
+import java.net.SocketAddress;
+import java.util.regex.Pattern;
 
 public class V680ProtocolDecoder extends BaseProtocolDecoder {
 
-    private Long deviceId;
-
-    public V680ProtocolDecoder(ServerManager serverManager) {
-        super(serverManager);
+    public V680ProtocolDecoder(V680Protocol protocol) {
+        super(protocol);
     }
 
-    static private Pattern pattern = Pattern.compile(
-            "(?:#(\\d+)#" +                // IMEI
-            "([^#]*)#)?" +                 // User
-            "(\\d+)#" +                    // Fix
-            "([^#]+)#" +                   // Password
-            "[^#]+#" +
-            "(\\d+)#" +                    // Packet number
-            "([^#]+)#" +                   // GSM base station
-            "(?:[^#]+#)?" +
-            "(\\d+)(\\d{2}\\.\\d+)," +     // Longitude (DDDMM.MMMM)
-            "([EW])," +
-            "(\\d{2})(\\d{2}\\.\\d+)," +   // Latitude (DDMM.MMMM)
-            "([NS])," +
-            "(\\d+\\.\\d+)," +             // Speed
-            "(\\d+\\.?\\d*)?#" +           // Course
-            "(\\d{2})(\\d{2})(\\d{2})#" +  // Date (DDMMYY)
-            "(\\d{2})(\\d{2})(\\d{2})" +   // Time (HHMMSS)
-            ".*");
+    private static final Pattern PATTERN = new PatternBuilder()
+            .groupBegin()
+            .number("#(d+)#")                    // imei
+            .expression("([^#]*)#")              // user
+            .groupEnd("?")
+            .number("(d+)#")                     // fix
+            .expression("([^#]+)#")              // password
+            .expression("([^#]+)#")              // event
+            .number("(d+)#")                     // packet number
+            .expression("([^#]+)?#?")            // gsm base station
+            .expression("(?:[^#]+#)?")
+            .number("(d+.d+),([EW]),")           // longitude
+            .number("(d+.d+),([NS]),")           // latitude
+            .number("(d+.d+),")                  // speed
+            .number("(d+.?d*)?#")                // course
+            .number("(dd)(dd)(dd)#")             // date (ddmmyy)
+            .number("(dd)(dd)(dd)")              // time (hhmmss)
+            .any()
+            .compile();
 
     @Override
     protected Object decode(
-            ChannelHandlerContext ctx, Channel channel, Object msg)
-            throws Exception {
+            Channel channel, SocketAddress remoteAddress, Object msg) throws Exception {
 
         String sentence = (String) msg;
-        
-        // Detect device ID
+        sentence = sentence.trim();
+
         if (sentence.length() == 16) {
-            String imei = sentence.substring(1, sentence.length());
-            try {
-                deviceId = getDataManager().getDeviceByImei(imei).getId();
-            } catch(Exception error) {
-                Log.warning("Unknown device - " + imei);
-            }
+
+            getDeviceSession(channel, remoteAddress, sentence.substring(1, sentence.length()));
+
         } else {
 
-            // Parse message
-            Matcher parser = pattern.matcher(sentence);
+            Parser parser = new Parser(PATTERN, sentence);
             if (!parser.matches()) {
                 return null;
             }
 
-            // Create new position
-            Position position = new Position();
-            ExtendedInfoFormatter extendedInfo = new ExtendedInfoFormatter("v680");
-            Integer index = 1;
+            Position position = new Position(getProtocolName());
 
-            // Get device by IMEI
-            String imei = parser.group(index++);
-            if (imei != null) {
-                try {
-                    deviceId = getDataManager().getDeviceByImei(imei).getId();
-                } catch(Exception error) {
-                    Log.warning("Unknown device - " + imei);
-                    return null;
-                }
+            DeviceSession deviceSession;
+            if (parser.hasNext()) {
+                deviceSession = getDeviceSession(channel, remoteAddress, parser.next());
+            } else {
+                deviceSession = getDeviceSession(channel, remoteAddress);
             }
-            if (deviceId == null) {
+            if (deviceSession == null) {
                 return null;
             }
-            position.setDeviceId(deviceId);
+            position.setDeviceId(deviceSession.getDeviceId());
 
-            // User
-            extendedInfo.set("user", parser.group(index++));
+            position.set("user", parser.next());
+            position.setValid(parser.nextInt(0) > 0);
+            position.set("password", parser.next());
+            position.set(Position.KEY_EVENT, parser.next());
+            position.set("packet", parser.next());
+            position.set("lbsData", parser.next());
 
-            // Validity
-            position.setValid(Integer.valueOf(parser.group(index++)) > 0 ? true : false);
+            double lon = parser.nextDouble(0);
+            boolean west = parser.next().equals("W");
+            double lat = parser.nextDouble(0);
+            boolean south = parser.next().equals("S");
 
-            // Password
-            extendedInfo.set("password", parser.group(index++));
+            if (lat > 90 || lon > 180) {
+                int lonDegrees = (int) (lon * 0.01);
+                lon = (lon - lonDegrees * 100) / 60.0;
+                lon += lonDegrees;
 
-            // Packet number
-            extendedInfo.set("packet", parser.group(index++));
-
-            // GSM base station
-            extendedInfo.set("gsm", parser.group(index++));
-
-            // Longitude
-            Double lonlitude = Double.valueOf(parser.group(index++));
-            lonlitude += Double.valueOf(parser.group(index++)) / 60;
-            if (parser.group(index++).compareTo("W") == 0) lonlitude = -lonlitude;
-            position.setLongitude(lonlitude);
-
-            // Latitude
-            Double latitude = Double.valueOf(parser.group(index++));
-            latitude += Double.valueOf(parser.group(index++)) / 60;
-            if (parser.group(index++).compareTo("S") == 0) latitude = -latitude;
-            position.setLatitude(latitude);
-
-            // Altitude
-            position.setAltitude(0.0);
-
-            // Speed and Course
-            position.setSpeed(Double.valueOf(parser.group(index++)));
-            String course = parser.group(index++);
-            if (course != null) {
-                position.setCourse(Double.valueOf(course));
-            } else {
-                position.setCourse(0.0);
+                int latDegrees = (int) (lat * 0.01);
+                lat = (lat - latDegrees * 100) / 60.0;
+                lat += latDegrees;
             }
 
-            // Date
-            Calendar time = Calendar.getInstance(TimeZone.getTimeZone("UTC"));
-            time.clear();
-            time.set(Calendar.DAY_OF_MONTH, Integer.valueOf(parser.group(index++)));
-            time.set(Calendar.MONTH, Integer.valueOf(parser.group(index++)) - 1);
-            time.set(Calendar.YEAR, 2000 + Integer.valueOf(parser.group(index++)));
+            position.setLongitude(west ? -lon : lon);
+            position.setLatitude(south ? -lat : lat);
 
-            // Time
-            time.set(Calendar.HOUR, Integer.valueOf(parser.group(index++)));
-            time.set(Calendar.MINUTE, Integer.valueOf(parser.group(index++)));
-            time.set(Calendar.SECOND, Integer.valueOf(parser.group(index++)));
-            position.setTime(time.getTime());
+            position.setSpeed(parser.nextDouble(0));
+            position.setCourse(parser.nextDouble(0));
 
-            // Extended info
-            position.setExtendedInfo(extendedInfo.toString());
+            int day = parser.nextInt(0);
+            int month = parser.nextInt(0);
+            if (day == 0 && month == 0) {
+                return null; // invalid date
+            }
+
+            DateBuilder dateBuilder = new DateBuilder()
+                    .setDate(parser.nextInt(0), month, day)
+                    .setTime(parser.nextInt(0), parser.nextInt(0), parser.nextInt(0));
+            position.setTime(dateBuilder.getDate());
 
             return position;
         }
-        
+
         return null;
     }
 

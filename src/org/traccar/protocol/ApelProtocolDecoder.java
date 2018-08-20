@@ -1,5 +1,5 @@
 /*
- * Copyright 2013 Anton Tananaev (anton.tananaev@gmail.com)
+ * Copyright 2013 - 2018 Anton Tananaev (anton@traccar.org)
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,250 +15,189 @@
  */
 package org.traccar.protocol;
 
-import java.nio.ByteOrder;
-import java.nio.charset.Charset;
-import java.sql.ResultSet;
-import java.util.Calendar;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.Channel;
+import org.traccar.BaseProtocolDecoder;
+import org.traccar.DeviceSession;
+import org.traccar.NetworkMessage;
+import org.traccar.helper.Checksum;
+import org.traccar.helper.UnitsConverter;
+import org.traccar.model.Position;
+
+import java.net.SocketAddress;
+import java.nio.charset.StandardCharsets;
+import java.util.Date;
 import java.util.LinkedList;
 import java.util.List;
-import java.util.Properties;
-import java.util.TimeZone;
-import org.jboss.netty.buffer.ChannelBuffer;
-import org.jboss.netty.buffer.ChannelBuffers;
-import org.jboss.netty.channel.Channel;
-import org.jboss.netty.channel.ChannelHandlerContext;
-import org.traccar.BaseProtocolDecoder;
-import org.traccar.ServerManager;
-import org.traccar.helper.AdvancedConnection;
-import org.traccar.helper.Crc;
-import org.traccar.helper.Log;
-import org.traccar.helper.NamedParameterStatement;
-import org.traccar.model.ExtendedInfoFormatter;
-import org.traccar.model.Position;
 
 public class ApelProtocolDecoder extends BaseProtocolDecoder {
 
-    private long deviceId;
     private long lastIndex;
     private long newIndex;
 
-    public ApelProtocolDecoder(ServerManager serverManager) {
-        super(serverManager);
+    public ApelProtocolDecoder(ApelProtocol protocol) {
+        super(protocol);
     }
 
-    /*
-     * Message types
-     */
-    private static final short MSG_TYPE_NULL = 0;
-    private static final short MSG_TYPE_REQUEST_TRACKER_ID = 10;
-    private static final short MSG_TYPE_TRACKER_ID = 11;
-    private static final short MSG_TYPE_TRACKER_ID_EXT = 12;
-    private static final short MSG_TYPE_DISCONNECT = 20;
-    private static final short MSG_TYPE_REQUEST_PASSWORD = 30;
-    private static final short MSG_TYPE_PASSWORD = 31;
-    private static final short MSG_TYPE_REQUEST_STATE_FULL_INFO = 90;
-    private static final short MSG_TYPE_STATE_FULL_INFO_T104 = 92;
-    private static final short MSG_TYPE_REQUEST_CURRENT_GPS_DATA = 100;
-    private static final short MSG_TYPE_CURRENT_GPS_DATA = 101;
-    private static final short MSG_TYPE_REQUEST_SENSORS_STATE = 110;
-    private static final short MSG_TYPE_SENSORS_STATE = 111;
-    private static final short MSG_TYPE_SENSORS_STATE_T100 = 112;
-    private static final short MSG_TYPE_SENSORS_STATE_T100_4 = 113;
-    private static final short MSG_TYPE_REQUEST_LAST_LOG_INDEX = 120;
-    private static final short MSG_TYPE_LAST_LOG_INDEX = 121;
-    private static final short MSG_TYPE_REQUEST_LOG_RECORDS = 130;
-    private static final short MSG_TYPE_LOG_RECORDS = 131;
-    private static final short MSG_TYPE_EVENT = 141;
-    private static final short MSG_TYPE_TEXT = 150;
-    private static final short MSG_TYPE_ACK_ALARM = 160;
-    private static final short MSG_TYPE_SET_TRACKER_MODE = 170;
-    private static final short MSG_TYPE_GPRS_COMMAND = 180;
-
-    private static final String HEX_CHARS = "0123456789ABCDEF";
-
-    private void loadLastIndex() {
-        try {
-            Properties p = getServerManager().getProperties();
-            if (p.contains("database.selectLastIndex")) {
-                AdvancedConnection connection = new AdvancedConnection(
-                        p.getProperty("database.url"), p.getProperty("database.user"), p.getProperty("database.password"));
-                NamedParameterStatement queryLastIndex = new NamedParameterStatement(connection, p.getProperty("database.selectLastIndex"));
-                queryLastIndex.prepare();
-                queryLastIndex.setLong("device_id", deviceId);
-                ResultSet result = queryLastIndex.executeQuery();
-                if (result.next()) {
-                    lastIndex = result.getLong(1);
-                }
-            }
-        } catch(Exception error) {
-        }
-    }
+    public static final short MSG_NULL = 0;
+    public static final short MSG_REQUEST_TRACKER_ID = 10;
+    public static final short MSG_TRACKER_ID = 11;
+    public static final short MSG_TRACKER_ID_EXT = 12;
+    public static final short MSG_DISCONNECT = 20;
+    public static final short MSG_REQUEST_PASSWORD = 30;
+    public static final short MSG_PASSWORD = 31;
+    public static final short MSG_REQUEST_STATE_FULL_INFO = 90;
+    public static final short MSG_STATE_FULL_INFO_T104 = 92;
+    public static final short MSG_REQUEST_CURRENT_GPS_DATA = 100;
+    public static final short MSG_CURRENT_GPS_DATA = 101;
+    public static final short MSG_REQUEST_SENSORS_STATE = 110;
+    public static final short MSG_SENSORS_STATE = 111;
+    public static final short MSG_SENSORS_STATE_T100 = 112;
+    public static final short MSG_SENSORS_STATE_T100_4 = 113;
+    public static final short MSG_REQUEST_LAST_LOG_INDEX = 120;
+    public static final short MSG_LAST_LOG_INDEX = 121;
+    public static final short MSG_REQUEST_LOG_RECORDS = 130;
+    public static final short MSG_LOG_RECORDS = 131;
+    public static final short MSG_EVENT = 141;
+    public static final short MSG_TEXT = 150;
+    public static final short MSG_ACK_ALARM = 160;
+    public static final short MSG_SET_TRACKER_MODE = 170;
+    public static final short MSG_GPRS_COMMAND = 180;
 
     private void sendSimpleMessage(Channel channel, short type) {
-        ChannelBuffer request = ChannelBuffers.directBuffer(ByteOrder.LITTLE_ENDIAN, 8);
-        request.writeShort(type);
-        request.writeShort(0);
-        request.writeInt(Crc.crc32(request.toByteBuffer(0, 4)));
-        channel.write(request);
+        ByteBuf request = Unpooled.buffer(8);
+        request.writeShortLE(type);
+        request.writeShortLE(0);
+        request.writeIntLE(Checksum.crc32(request.nioBuffer(0, 4)));
+        channel.writeAndFlush(new NetworkMessage(request, channel.remoteAddress()));
     }
 
     private void requestArchive(Channel channel) {
         if (lastIndex == 0) {
             lastIndex = newIndex;
         } else if (newIndex > lastIndex) {
-            ChannelBuffer request = ChannelBuffers.directBuffer(ByteOrder.LITTLE_ENDIAN, 14);
-            request.writeShort(MSG_TYPE_REQUEST_LOG_RECORDS);
-            request.writeShort(6);
-            request.writeInt((int) lastIndex);
-            request.writeShort(512);
-            request.writeInt(Crc.crc32(request.toByteBuffer(0, 10)));
-            channel.write(request);
+            ByteBuf request = Unpooled.buffer(14);
+            request.writeShortLE(MSG_REQUEST_LOG_RECORDS);
+            request.writeShortLE(6);
+            request.writeIntLE((int) lastIndex);
+            request.writeShortLE(512);
+            request.writeIntLE(Checksum.crc32(request.nioBuffer(0, 10)));
+            channel.writeAndFlush(new NetworkMessage(request, channel.remoteAddress()));
         }
     }
 
     @Override
     protected Object decode(
-            ChannelHandlerContext ctx, Channel channel, Object msg)
-            throws Exception {
+            Channel channel, SocketAddress remoteAddress, Object msg) throws Exception {
 
-        ChannelBuffer buf = (ChannelBuffer) msg;
-        int type = buf.readUnsignedShort();
+        ByteBuf buf = (ByteBuf) msg;
+        int type = buf.readUnsignedShortLE();
         boolean alarm = (type & 0x8000) != 0;
         type = type & 0x7FFF;
-        buf.readUnsignedShort(); // length
-        
+        buf.readUnsignedShortLE(); // length
+
         if (alarm) {
-            sendSimpleMessage(channel, MSG_TYPE_ACK_ALARM);
-        }
-        
-        if (type == MSG_TYPE_TRACKER_ID) {
-            Log.warning("Unsupported authentication type");
-            return null;
+            sendSimpleMessage(channel, MSG_ACK_ALARM);
         }
 
-        if (type == MSG_TYPE_TRACKER_ID_EXT) {
-            long id = buf.readUnsignedInt();
-            int length = buf.readUnsignedShort();
-            buf.skipBytes(length);
-            length = buf.readUnsignedShort();
-            String imei = buf.readBytes(length).toString(Charset.defaultCharset());
-            try {
-                deviceId = getDataManager().getDeviceByImei(imei).getId();
-                loadLastIndex();
-            } catch(Exception error) {
-                Log.warning("Unknown device - " + imei + " (id - " + id + ")");
-            }
+        if (type == MSG_TRACKER_ID) {
+            return null; // unsupported authentication type
         }
-        
-        else if (type == MSG_TYPE_LAST_LOG_INDEX) {
-            long index = buf.readUnsignedInt();
+
+        if (type == MSG_TRACKER_ID_EXT) {
+
+            buf.readUnsignedIntLE(); // id
+            int length = buf.readUnsignedShortLE();
+            buf.skipBytes(length);
+            length = buf.readUnsignedShortLE();
+            getDeviceSession(channel, remoteAddress, buf.readSlice(length).toString(StandardCharsets.US_ASCII));
+
+        } else if (type == MSG_LAST_LOG_INDEX) {
+
+            long index = buf.readUnsignedIntLE();
             if (index > 0) {
                 newIndex = index;
                 requestArchive(channel);
             }
-        }
 
-        // Position
-        else if (deviceId != 0 && (type == MSG_TYPE_CURRENT_GPS_DATA || type == MSG_TYPE_STATE_FULL_INFO_T104 || type == MSG_TYPE_LOG_RECORDS)) {
-            List<Position> positions = new LinkedList<Position>();
+        } else if (type == MSG_CURRENT_GPS_DATA || type == MSG_STATE_FULL_INFO_T104 || type == MSG_LOG_RECORDS) {
+
+            DeviceSession deviceSession = getDeviceSession(channel, remoteAddress);
+            if (deviceSession == null) {
+                return null;
+            }
+
+            List<Position> positions = new LinkedList<>();
 
             int recordCount = 1;
-            if (type == MSG_TYPE_LOG_RECORDS) {
-                recordCount = buf.readUnsignedShort();
+            if (type == MSG_LOG_RECORDS) {
+                recordCount = buf.readUnsignedShortLE();
             }
 
             for (int j = 0; j < recordCount; j++) {
-                Position position = new Position();
-                ExtendedInfoFormatter extendedInfo = new ExtendedInfoFormatter("apel");
-                position.setDeviceId(deviceId);
+                Position position = new Position(getProtocolName());
+                position.setDeviceId(deviceSession.getDeviceId());
 
-                // Message index
                 int subtype = type;
-                if (type == MSG_TYPE_LOG_RECORDS) {
-                    extendedInfo.set("archive", true);
-                    lastIndex = buf.readUnsignedInt() + 1;
-                    position.setId(lastIndex);
+                if (type == MSG_LOG_RECORDS) {
+                    position.set(Position.KEY_ARCHIVE, true);
+                    lastIndex = buf.readUnsignedIntLE() + 1;
+                    position.set(Position.KEY_INDEX, lastIndex);
 
-                    subtype = buf.readUnsignedShort();
-                    if (subtype != MSG_TYPE_CURRENT_GPS_DATA && subtype != MSG_TYPE_STATE_FULL_INFO_T104) {
-                        buf.skipBytes(buf.readUnsignedShort());
+                    subtype = buf.readUnsignedShortLE();
+                    if (subtype != MSG_CURRENT_GPS_DATA && subtype != MSG_STATE_FULL_INFO_T104) {
+                        buf.skipBytes(buf.readUnsignedShortLE());
                         continue;
                     }
-                    buf.readUnsignedShort(); // length
+                    buf.readUnsignedShortLE(); // length
                 }
 
-                // Time
-                Calendar time = Calendar.getInstance(TimeZone.getTimeZone("UTC"));
-                time.clear();
-                time.setTimeInMillis(buf.readUnsignedInt() * 1000);
-                position.setTime(time.getTime());
+                position.setTime(new Date(buf.readUnsignedIntLE() * 1000));
+                position.setLatitude(buf.readIntLE() * 180.0 / 0x7FFFFFFF);
+                position.setLongitude(buf.readIntLE() * 180.0 / 0x7FFFFFFF);
 
-                // Latitude
-                position.setLatitude(buf.readInt() * 180.0 / 0x7FFFFFFF);
-
-                // Longitude
-                position.setLongitude(buf.readInt() * 180.0 / 0x7FFFFFFF);
-
-                // Speed and Validity
-                if (subtype == MSG_TYPE_STATE_FULL_INFO_T104) {
+                if (subtype == MSG_STATE_FULL_INFO_T104) {
                     int speed = buf.readUnsignedByte();
                     position.setValid(speed != 255);
-                    position.setSpeed(speed * 0.539957);
-                    extendedInfo.set("hdop", buf.readByte());
+                    position.setSpeed(UnitsConverter.knotsFromKph(speed));
+                    position.set(Position.KEY_HDOP, buf.readByte());
                 } else {
-                    int speed = buf.readShort();
+                    int speed = buf.readShortLE();
                     position.setValid(speed != -1);
-                    position.setSpeed(speed / 100.0 * 0.539957);
+                    position.setSpeed(UnitsConverter.knotsFromKph(speed * 0.01));
                 }
 
-                // Course
-                position.setCourse(buf.readShort() / 100.0);
+                position.setCourse(buf.readShortLE() * 0.01);
+                position.setAltitude(buf.readShortLE());
 
-                // Altitude
-                position.setAltitude((double) buf.readShort());
+                if (subtype == MSG_STATE_FULL_INFO_T104) {
 
-                if (subtype == MSG_TYPE_STATE_FULL_INFO_T104) {
+                    position.set(Position.KEY_SATELLITES, buf.readUnsignedByte());
+                    position.set(Position.KEY_RSSI, buf.readUnsignedByte());
+                    position.set(Position.KEY_EVENT, buf.readUnsignedShortLE());
+                    position.set(Position.KEY_ODOMETER, buf.readUnsignedIntLE());
+                    position.set(Position.KEY_INPUT, buf.readUnsignedByte());
+                    position.set(Position.KEY_OUTPUT, buf.readUnsignedByte());
 
-                    // Satellites
-                    extendedInfo.set("satellites", buf.readUnsignedByte());
-                    
-                    // Cell signal
-                    extendedInfo.set("gsm", buf.readUnsignedByte());
-
-                    // Event type
-                    extendedInfo.set("event", buf.readUnsignedShort());
-
-                    // Milage
-                    extendedInfo.set("milage", buf.readUnsignedInt());
-
-                    // Input/Output
-                    extendedInfo.set("input", buf.readUnsignedByte());
-                    extendedInfo.set("output", buf.readUnsignedByte());
-                    
-                    // Analog sensors
                     for (int i = 1; i <= 8; i++) {
-                        extendedInfo.set("adc" + i, buf.readUnsignedShort());
+                        position.set(Position.PREFIX_ADC + i, buf.readUnsignedShortLE());
                     }
-                    
-                    // Counters
-                    extendedInfo.set("c0", buf.readUnsignedInt());
-                    extendedInfo.set("c1", buf.readUnsignedInt());
-                    extendedInfo.set("c2", buf.readUnsignedInt());
-                }
 
-                // Extended info
-                position.setExtendedInfo(extendedInfo.toString());
+                    position.set(Position.PREFIX_COUNT + 1, buf.readUnsignedIntLE());
+                    position.set(Position.PREFIX_COUNT + 2, buf.readUnsignedIntLE());
+                    position.set(Position.PREFIX_COUNT + 3, buf.readUnsignedIntLE());
+                }
 
                 positions.add(position);
             }
 
-            // Skip CRC
-            buf.readUnsignedInt();
-            
-            if (type == MSG_TYPE_LOG_RECORDS) {
+            buf.readUnsignedIntLE(); // crc
+
+            if (type == MSG_LOG_RECORDS) {
                 requestArchive(channel);
             } else {
-                sendSimpleMessage(channel, MSG_TYPE_REQUEST_LAST_LOG_INDEX);
+                sendSimpleMessage(channel, MSG_REQUEST_LAST_LOG_INDEX);
             }
 
             return positions;

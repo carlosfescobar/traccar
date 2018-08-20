@@ -1,5 +1,5 @@
 /*
- * Copyright 2013 Anton Tananaev (anton.tananaev@gmail.com)
+ * Copyright 2013 - 2018 Anton Tananaev (anton@traccar.org)
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,110 +15,126 @@
  */
 package org.traccar.protocol;
 
-import java.util.Calendar;
-import java.util.TimeZone;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-import org.jboss.netty.channel.Channel;
-import org.jboss.netty.channel.ChannelHandlerContext;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.Channel;
 import org.traccar.BaseProtocolDecoder;
-import org.traccar.ServerManager;
-import org.traccar.helper.Log;
-import org.traccar.model.ExtendedInfoFormatter;
+import org.traccar.DeviceSession;
+import org.traccar.NetworkMessage;
+import org.traccar.helper.DateBuilder;
+import org.traccar.helper.Parser;
+import org.traccar.helper.PatternBuilder;
 import org.traccar.model.Position;
+
+import java.net.SocketAddress;
+import java.nio.charset.StandardCharsets;
+import java.util.regex.Pattern;
 
 public class Tk102ProtocolDecoder extends BaseProtocolDecoder {
 
-    private Long deviceId;
-
-    public Tk102ProtocolDecoder(ServerManager serverManager) {
-        super(serverManager);
+    public Tk102ProtocolDecoder(Tk102Protocol protocol) {
+        super(protocol);
     }
 
-    static private Pattern pattern = Pattern.compile(
-            "\\[\\=\\d{10}.\\(.{3}" +
-            "(\\d{2})(\\d{2})(\\d{2})" +   // Time (HHMMSS)
-            "([AV])" +                     // Validity
-            "(\\d{2})(\\d{2}\\.\\d{4})" +  // Latitude (DDMM.MMMM)
-            "([NS])" +
-            "(\\d{3})(\\d{2}\\.\\d{4})" +  // Longitude (DDDMM.MMMM)
-            "([EW])" +
-            "(\\d{3}\\.\\d{3})" +           // Speed
-            "(\\d{2})(\\d{2})(\\d{2})" +   // Date (DDMMYY)
-            ".+");
+    public static final int MSG_LOGIN_REQUEST = 0x80;
+    public static final int MSG_LOGIN_REQUEST_2 = 0x21;
+    public static final int MSG_LOGIN_RESPONSE = 0x00;
+    public static final int MSG_HEARTBEAT_REQUEST = 0xF0;
+    public static final int MSG_HEARTBEAT_RESPONSE = 0xFF;
+    public static final int MSG_REPORT_ONCE = 0x90;
+    public static final int MSG_REPORT_INTERVAL = 0x93;
+
+    public static final int MODE_GPRS = 0x30;
+    public static final int MODE_GPRS_SMS = 0x33;
+
+    private static final Pattern PATTERN = new PatternBuilder()
+            .text("(")
+            .expression("[A-Z]+")
+            .number("(dd)(dd)(dd)")              // time (hhmmss)
+            .expression("([AV])")                // validity
+            .number("(dd)(dd.dddd)([NS])")       // latitude
+            .number("(ddd)(dd.dddd)([EW])")      // longitude
+            .number("(ddd.ddd)")                 // speed
+            .number("(dd)(dd)(dd)")              // date (ddmmyy)
+            .any()
+            .text(")")
+            .compile();
+
+    private void sendResponse(Channel channel, int type, ByteBuf dataSequence, ByteBuf content) {
+        if (channel != null) {
+            ByteBuf response = Unpooled.buffer();
+            response.writeByte('[');
+            response.writeByte(type);
+            response.writeBytes(dataSequence);
+            response.writeByte(content.readableBytes());
+            response.writeBytes(content);
+            content.release();
+            response.writeByte(']');
+            channel.writeAndFlush(new NetworkMessage(response, channel.remoteAddress()));
+        }
+    }
 
     @Override
     protected Object decode(
-            ChannelHandlerContext ctx, Channel channel, Object msg)
-            throws Exception {
+            Channel channel, SocketAddress remoteAddress, Object msg) throws Exception {
 
-        String sentence = (String) msg;
+        ByteBuf buf = (ByteBuf) msg;
 
-        // Detect device identifier
-        if (sentence.startsWith("[!")) {
-            String imei = sentence.substring(14, 14 + 15);
-            try {
-                deviceId = getDataManager().getDeviceByImei(imei).getId();
-            } catch(Exception error) {
-                Log.warning("Unknown device - " + imei);
+        buf.skipBytes(1); // header
+        int type = buf.readUnsignedByte();
+        ByteBuf dataSequence = buf.readSlice(10);
+        int length = buf.readUnsignedByte();
+
+        if (type == MSG_LOGIN_REQUEST || type == MSG_LOGIN_REQUEST_2) {
+
+            ByteBuf data = buf.readSlice(length);
+
+            String id;
+            if (type == MSG_LOGIN_REQUEST) {
+                id =  data.toString(StandardCharsets.US_ASCII);
+            } else {
+                id = data.copy(1, 15).toString(StandardCharsets.US_ASCII);
             }
-        }
 
-        // Parse message
-        else if (sentence.startsWith("[=") && deviceId != null) {
+            if (getDeviceSession(channel, remoteAddress, id) != null) {
+                ByteBuf response = Unpooled.buffer();
+                response.writeByte(MODE_GPRS);
+                response.writeBytes(data);
+                sendResponse(channel, MSG_LOGIN_RESPONSE, dataSequence, response);
+            }
 
-            // Parse message
-            Matcher parser = pattern.matcher(sentence);
+        } else if (type == MSG_HEARTBEAT_REQUEST) {
+
+            sendResponse(channel, MSG_HEARTBEAT_RESPONSE, dataSequence, buf.readRetainedSlice(length));
+
+        } else {
+
+            DeviceSession deviceSession = getDeviceSession(channel, remoteAddress);
+            if (deviceSession == null) {
+                return null;
+            }
+
+            Parser parser = new Parser(PATTERN, buf.readSlice(length).toString(StandardCharsets.US_ASCII));
             if (!parser.matches()) {
                 return null;
             }
 
-            // Create new position
-            Position position = new Position();
-            ExtendedInfoFormatter extendedInfo = new ExtendedInfoFormatter("tk102");
-            position.setDeviceId(deviceId);
+            Position position = new Position(getProtocolName());
+            position.setDeviceId(deviceSession.getDeviceId());
 
-            Integer index = 1;
+            DateBuilder dateBuilder = new DateBuilder()
+                    .setTime(parser.nextInt(0), parser.nextInt(0), parser.nextInt(0));
 
-            // Time
-            Calendar time = Calendar.getInstance(TimeZone.getTimeZone("UTC"));
-            time.clear();
-            time.set(Calendar.HOUR, Integer.valueOf(parser.group(index++)));
-            time.set(Calendar.MINUTE, Integer.valueOf(parser.group(index++)));
-            time.set(Calendar.SECOND, Integer.valueOf(parser.group(index++)));
+            position.setValid(parser.next().equals("A"));
+            position.setLatitude(parser.nextCoordinate());
+            position.setLongitude(parser.nextCoordinate());
+            position.setSpeed(parser.nextDouble(0));
 
-            // Validity
-            position.setValid(parser.group(index++).compareTo("A") == 0 ? true : false);
+            dateBuilder.setDateReverse(parser.nextInt(0), parser.nextInt(0), parser.nextInt(0));
+            position.setTime(dateBuilder.getDate());
 
-            // Latitude
-            Double latitude = Double.valueOf(parser.group(index++));
-            latitude += Double.valueOf(parser.group(index++)) / 60;
-            if (parser.group(index++).compareTo("S") == 0) latitude = -latitude;
-            position.setLatitude(latitude);
-
-            // Longitude
-            Double lonlitude = Double.valueOf(parser.group(index++));
-            lonlitude += Double.valueOf(parser.group(index++)) / 60;
-            if (parser.group(index++).compareTo("W") == 0) lonlitude = -lonlitude;
-            position.setLongitude(lonlitude);
-
-            // Speed
-            position.setSpeed(Double.valueOf(parser.group(index++)));
-
-            // Course
-            position.setCourse(0.0);
-
-            // Date
-            time.set(Calendar.DAY_OF_MONTH, Integer.valueOf(parser.group(index++)));
-            time.set(Calendar.MONTH, Integer.valueOf(parser.group(index++)) - 1);
-            time.set(Calendar.YEAR, 2000 + Integer.valueOf(parser.group(index++)));
-            position.setTime(time.getTime());
-
-            // Altitude
-            position.setAltitude(0.0);
-
-            position.setExtendedInfo(extendedInfo.toString());
             return position;
+
         }
 
         return null;

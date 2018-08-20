@@ -1,160 +1,155 @@
-#!/bin/sh
+#!/bin/bash
 
-# GENERAL REQUIREMENTS
+#
+# Script to create installers
+#
 
-# Check web application
-if [ -e "traccar-web.war" ]; then
-    echo "Web application archive found"
-else
-    echo "Put traccar-web.war into this directory"
-    exit 0
+cd $(dirname $0)
+
+if [[ $# -lt 1 ]]
+then
+  echo "USAGE: $0 <version>"
+  exit 1
 fi
 
-# Check wrapper
-if ls wrapper-delta-pack-*.tar.gz &> /dev/null; then
-    echo "Java wrapper package found"
-else
-    echo "Put wrapper-delta-pack-*.tar.gz into this directory"
-    exit 0
-fi
+VERSION=$1
 
-# WINDOWS REQUIREMENTS
+check_requirement () {
+  if ! eval $1 &>/dev/null
+  then
+    echo $2
+    exit 1
+  fi 
+}
 
-# Check inno setup
-if ls isetup-*.exe &> /dev/null; then
-    echo "Inno setup installer found"
-else
-    echo "Put isetup-*.exe into this directory"
-    exit 0
-fi
+check_requirement "ls ../../ext-6.2.0" "Missing ../../ext-6.2.0 (https://www.sencha.com/legal/GPL/)"
+check_requirement "ls yajsw-*.zip" "Missing yajsw-*.zip (https://sourceforge.net/projects/yajsw/files/)"
+check_requirement "ls innosetup-*.exe" "Missing isetup-*.exe (http://www.jrsoftware.org/isdl.php)"
+check_requirement "which sencha" "Missing sencha cmd package (https://www.sencha.com/products/extjs/cmd-download/)"
+check_requirement "which wine" "Missing wine package"
+check_requirement "which innoextract" "Missing innoextract package"
+check_requirement "which makeself" "Missing makeself package"
+check_requirement "which dos2unix" "Missing dos2unix package"
 
-# Check wine
-if which wine > /dev/null; then
-    echo "Found wine"
-else
-    echo "Install wine package"
-    exit 0
-fi
+prepare () {
+  unzip yajsw-*.zip
+  mv yajsw-*/ yajsw/
 
-# Check innoextract
-if which innoextract > /dev/null; then
-    echo "Found Innoextract"
-else
-    echo "Install innoextract package"
-    exit 0
-fi
+  ../traccar-web/tools/minify.sh
 
-# LINUX REQUIREMENTS
+  innoextract innosetup-*.exe
+  echo "If you got any errors here try isetup version 5.5.5 (or check supported versions using 'innoextract -v')"
+}
 
-# Check makeself
-if which makeself > /dev/null; then
-    echo "Found makeself"
-else
-    echo "Install makeself package"
-    exit 0
-fi
+cleanup () {
+  rm -r yajsw/
 
-# GENERAL PREPARATION
+  rm ../traccar-web/web/app.min.js
 
-tar -xzf wrapper-delta-pack-*.tar.gz
-mv wrapper-delta-pack-*/ wrapper/
+  rm -r app/
+}
 
-# UNIVERSAL PACKAGE
+copy_wrapper () {
+  cp yajsw/$1/setenv* out/$1
+  cp yajsw/$1/wrapper* out/$1
+  cp yajsw/$1/install* out/$1
+  cp yajsw/$1/start* out/$1
+  cp yajsw/$1/stop* out/$1
+  cp yajsw/$1/uninstall* out/$1
 
-zip -j tracker-server.zip ../target/tracker-server.jar universal/README.txt
+  chmod +x out/$1/*
 
-# WINDOWS PACKAGE
+  cp yajsw/conf/wrapper.conf.default out/conf
 
-innoextract isetup-*.exe
-echo "NOTE: if you got any errors here try isetup version 5.4.3 (or check what versions are supported by 'innoextract -v')"
+  touch out/conf/wrapper.conf
+  echo "wrapper.java.command=java" >> out/conf/wrapper.conf
+  echo "wrapper.java.app.jar=tracker-server.jar" >> out/conf/wrapper.conf
+  echo "wrapper.app.parameter.1=./conf/traccar.xml" >> out/conf/wrapper.conf
+  echo "wrapper.java.additional.1=-Dfile.encoding=UTF-8" >> out/conf/wrapper.conf
+  echo "wrapper.logfile=logs/wrapper.log.YYYYMMDD" >> out/conf/wrapper.conf
+  echo "wrapper.logfile.rollmode=DATE" >> out/conf/wrapper.conf
+  echo "wrapper.ntservice.name=traccar" >> out/conf/wrapper.conf
+  echo "wrapper.ntservice.displayname=Traccar" >> out/conf/wrapper.conf
+  echo "wrapper.ntservice.description=Traccar" >> out/conf/wrapper.conf
+  echo "wrapper.daemon.run_level_dir=\${if (new File('/etc/rc0.d').exists()) return '/etc/rcX.d' else return '/etc/init.d/rcX.d'}" >> out/conf/wrapper.conf
 
-wine app/ISCC.exe windows/traccar.iss
+  cp -r yajsw/lib/* out/lib
+  find out/lib -type f -name ReadMe.txt -exec rm -f {} \;
 
-zip -j traccar-windows-32.zip windows/Output/setup.exe windows/README.txt
+  cp yajsw/templates/* out/templates
 
-rm -rf windows/Output/
-rm -rf tmp/
-rm -rf app/
+  cp yajsw/wrapper*.jar out
 
-# LINIX PACKAGE
+  if which xattr &>/dev/null
+  then
+    xattr -dr com.apple.quarantine out
+  fi
+}
 
-app='/opt/traccar'
+copy_files () {
+  cp ../target/tracker-server.jar out
+  cp ../target/lib/* out/lib
+  cp ../schema/* out/schema
+  cp -r ../templates/* out/templates
+  cp -r ../traccar-web/web/* out/web
+  cp default.xml out/conf
+  cp traccar.xml out/conf
+}
 
-rm -rf out
+package_windows () {
+  mkdir -p out/{bat,conf,data,lib,logs,web,schema,templates}
 
-mkdir out
-mkdir out/bin
-mkdir out/conf
-mkdir out/data
-mkdir out/lib
-mkdir out/logs
+  copy_wrapper "bat"
+  copy_files
 
-cp wrapper/src/bin/sh.script.in out/bin/traccar
-cp wrapper/lib/wrapper.jar out/lib
-cp wrapper/src/conf/wrapper.conf.in out/conf/wrapper.conf
+  wine app/ISCC.exe traccar.iss
 
-cp ../target/tracker-server.jar out
-cp ../target/lib/* out/lib
-cp traccar-web.war out
-cp linux/traccar.cfg out/conf
+  zip -j traccar-windows-$VERSION.zip Output/traccar-setup.exe README.txt
 
-sed -i 's/@app.name@/traccar/g' out/bin/traccar
-sed -i 's/@app.long.name@/traccar/g' out/bin/traccar
+  rm -r Output
+  rm -r tmp
+  rm -r out
+}
 
-sed -i '/wrapper.java.classpath.1/i\wrapper.java.classpath.2=../tracker-server.jar' out/conf/wrapper.conf
-sed -i "/wrapper.app.parameter.1/i\wrapper.app.parameter.2=$app/conf/traccar.cfg" out/conf/wrapper.conf
-sed -i 's/<YourMainClass>/org.traccar.Main/g' out/conf/wrapper.conf
-sed -i 's/@app.name@/traccar/g' out/conf/wrapper.conf
-sed -i 's/@app.long.name@/traccar/g' out/conf/wrapper.conf
-sed -i 's/@app.description@/traccar/g' out/conf/wrapper.conf
-sed -i 's/wrapper.logfile=..\/logs\/wrapper.log/wrapper.logfile=..\/logs\/wrapper.log.YYYYMMDD\nwrapper.logfile.rollmode=DATE/g' out/conf/wrapper.conf
+package_unix () {
+  mkdir -p out/{bin,conf,data,lib,logs,web,schema,templates}
 
-# linux 32
+  copy_wrapper "bin"
+  sed -i.bak "1s/.*/#\!\/usr\/bin\/env bash/" out/bin/stopDaemonNoPriv.sh
+  rm out/bin/stopDaemonNoPriv.sh.bak
+  find out -type f \( -name \*.sh -o -name \*.vm \) -print0 | xargs -0 dos2unix
+  copy_files
 
-cp wrapper/bin/wrapper-linux-x86-32 out/bin/wrapper
-cp wrapper/lib/libwrapper-linux-x86-32.so out/lib/libwrapper.so
-chmod +x out/bin/traccar
+  cp java-test/test.jar out
+  cp setup.sh out
+  makeself --notemp out traccar.run "traccar" ./setup.sh
 
-makeself out traccar.run "traccar" "mkdir $app; cp -rf * $app; $app/bin/traccar install"
-zip -j traccar-linux-32.zip traccar.run linux/README.txt
+  zip -j traccar-linux-$VERSION.zip traccar.run README.txt
+  cp traccar-linux-$VERSION.zip traccar-macos-$VERSION.zip
 
-# linux 64
+  rm traccar.run
+  rm -r out
+}
 
-cp wrapper/bin/wrapper-linux-x86-64 out/bin/wrapper
-cp wrapper/lib/libwrapper-linux-x86-64.so out/lib/libwrapper.so
-chmod +x out/bin/traccar
+package_universal () {
+  mkdir -p out/{conf,data,lib,logs,web,schema,templates}
 
-makeself out traccar.run "traccar" "mkdir $app; cp -rf * $app; $app/bin/traccar install"
-zip -j traccar-linux-64.zip traccar.run linux/README.txt
+  copy_files
 
-# linux arm
+  cp README.txt out
+  cp other/traccar.sh out
+  
+  cd out
+  zip -r ../traccar-other-$VERSION.zip *
+  cd ..
 
-cp wrapper/bin/wrapper-linux-armel-32 out/bin/
-cp wrapper/bin/wrapper-linux-armhf-32 out/bin/
-cp wrapper/lib/libwrapper-linux-armel-32.so out/lib/
-cp wrapper/lib/libwrapper-linux-armhf-32.so out/lib/
-chmod +x out/bin/traccar
+  rm -rf out/
+}
 
-makeself out traccar.run "traccar" "mkdir $app; cp -rf * $app; if [ -z "`readelf -A /proc/self/exe | grep Tag_ABI_VFP_args`" ]; then mv $app/bin/wrapper-linux-armel-32 $app/bin/wrapper; mv $app/lib/libwrapper-linux-armel-32.so $app/lib/libwrapper.so; else mv $app/bin/wrapper-linux-armhf-32 $app/bin/wrapper; mv $app/lib/libwrapper-linux-armhf-32.so $app/lib/libwrapper.so; fi; $app/bin/traccar install"
-zip -j traccar-linux-arm.zip traccar.run linux/README.txt
+prepare
 
-# MACOSX PACKAGE
+package_windows
+package_unix
+package_universal
 
-rm out/conf/traccar.cfg
-rm out/lib/libwrapper.so
-
-cp macosx/traccar.cfg out/conf
-
-cp wrapper/bin/wrapper-macosx-universal-64 out/bin/wrapper
-cp wrapper/lib/libwrapper-macosx-universal-64.jnilib out/lib/libwrapper.jnilib
-chmod +x out/bin/traccar
-
-makeself out traccar.run "traccar" "mkdir -p $app; cp -rf * $app; $app/bin/traccar install"
-zip -j traccar-macosx-64.zip traccar.run macosx/README.txt
-
-rm traccar.run
-#rm -rf out
-
-# GENERAL CLEANUP
-
-rm -rf wrapper/
+cleanup

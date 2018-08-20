@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Anton Tananaev (anton.tananaev@gmail.com)
+ * Copyright 2012 - 2018 Anton Tananaev (anton@traccar.org)
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,37 +15,31 @@
  */
 package org.traccar.protocol;
 
-import java.nio.ByteOrder;
-import java.nio.charset.Charset;
-import java.util.Calendar;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.Channel;
+import org.traccar.BaseProtocolDecoder;
+import org.traccar.DeviceSession;
+import org.traccar.NetworkMessage;
+import org.traccar.helper.BitUtil;
+import org.traccar.helper.DateBuilder;
+import org.traccar.helper.UnitsConverter;
+import org.traccar.model.Position;
+
+import java.net.SocketAddress;
+import java.nio.charset.StandardCharsets;
 import java.util.LinkedList;
 import java.util.List;
-import java.util.TimeZone;
-import org.jboss.netty.buffer.ChannelBuffer;
-import org.jboss.netty.buffer.ChannelBuffers;
-import org.jboss.netty.channel.Channel;
-import org.jboss.netty.channel.ChannelHandlerContext;
-import org.traccar.BaseProtocolDecoder;
-import org.traccar.ServerManager;
-import org.traccar.helper.Log;
-import org.traccar.model.ExtendedInfoFormatter;
-import org.traccar.model.Position;
 
 public class NavisProtocolDecoder extends BaseProtocolDecoder {
 
     private String prefix;
-    private long deviceId, serverId;
+    private long deviceUniqueId, serverId;
 
-    private static final Charset charset = Charset.defaultCharset();
-
-    private String imei;
-    private Long databaseDeviceId;
-
-    public NavisProtocolDecoder(ServerManager serverManager) {
-        super(serverManager);
+    public NavisProtocolDecoder(NavisProtocol protocol) {
+        super(protocol);
     }
 
-    // Format types
     public static final int F10 = 0x01;
     public static final int F20 = 0x02;
     public static final int F30 = 0x03;
@@ -63,174 +57,159 @@ public class NavisProtocolDecoder extends BaseProtocolDecoder {
         return false;
     }
 
-    private Position parsePosition(ChannelBuffer buf) {
-        Position position = new Position();
-        ExtendedInfoFormatter extendedInfo = new ExtendedInfoFormatter("navis");
+    private static final class ParseResult {
+        private final long id;
+        private final Position position;
 
-        position.setDeviceId(databaseDeviceId);
-        position.setAltitude(0.0);
+        private ParseResult(long id, Position position) {
+            this.id = id;
+            this.position = position;
+        }
 
-        // Format type
+        public long getId() {
+            return id;
+        }
+
+        public Position getPosition() {
+            return position;
+        }
+    }
+
+    private ParseResult parsePosition(DeviceSession deviceSession, ByteBuf buf) {
+        Position position = new Position(getProtocolName());
+
+        position.setDeviceId(deviceSession.getDeviceId());
+
         int format;
         if (buf.getUnsignedByte(buf.readerIndex()) == 0) {
-            format = buf.readUnsignedShort();
+            format = buf.readUnsignedShortLE();
         } else {
             format = buf.readUnsignedByte();
         }
-        extendedInfo.set("format", format);
+        position.set("format", format);
 
-        position.setId(buf.readUnsignedInt()); // sequence number
+        long index = buf.readUnsignedIntLE();
+        position.set(Position.KEY_INDEX, index);
 
-        // Event type
-        extendedInfo.set("event", buf.readUnsignedShort());
+        position.set(Position.KEY_EVENT, buf.readUnsignedShortLE());
 
-        // Event time
-        Calendar time = Calendar.getInstance(TimeZone.getTimeZone("UTC"));
-        time.clear();
-        time.set(Calendar.HOUR, buf.readUnsignedByte());
-        time.set(Calendar.MINUTE, buf.readUnsignedByte());
-        time.set(Calendar.SECOND, buf.readUnsignedByte());
-        time.set(Calendar.DAY_OF_MONTH, buf.readUnsignedByte());
-        time.set(Calendar.MONTH, buf.readUnsignedByte());
-        time.set(Calendar.YEAR, 2000 + buf.readUnsignedByte());
-        extendedInfo.set("time", time.getTimeInMillis());
+        buf.skipBytes(6); // event time
 
-        // Alarm status
-        extendedInfo.set("alarm", buf.readUnsignedByte());
+        short armedStatus = buf.readUnsignedByte();
+        position.set(Position.KEY_ARMED, armedStatus & 0x7F);
+        if (BitUtil.check(armedStatus, 7)) {
+            position.set(Position.KEY_ALARM, Position.ALARM_GENERAL);
+        }
+        position.set(Position.KEY_STATUS, buf.readUnsignedByte());
+        position.set(Position.KEY_RSSI, buf.readUnsignedByte());
 
-        // Modules status
-        extendedInfo.set("status", buf.readUnsignedByte());
-
-        // GSM signal
-        extendedInfo.set("gsm", buf.readUnsignedByte());
-
-        // Output
         if (isFormat(format, F10, F20, F30)) {
-            extendedInfo.set("output", buf.readUnsignedShort());
+            position.set(Position.KEY_OUTPUT, buf.readUnsignedShortLE());
         } else if (isFormat(format, F40, F50, F51, F52)) {
-            extendedInfo.set("output", buf.readUnsignedByte());
+            position.set(Position.KEY_OUTPUT, buf.readUnsignedByte());
         }
 
-        // Input
         if (isFormat(format, F10, F20, F30, F40)) {
-            extendedInfo.set("input", buf.readUnsignedShort());
+            position.set(Position.KEY_INPUT, buf.readUnsignedShortLE());
         } else if (isFormat(format, F50, F51, F52)) {
-            extendedInfo.set("input", buf.readUnsignedByte());
+            position.set(Position.KEY_INPUT, buf.readUnsignedByte());
         }
 
-        position.setPower(buf.readUnsignedShort() / 1000.0); // power
+        position.set(Position.KEY_POWER, buf.readUnsignedShortLE() * 0.001);
+        position.set(Position.KEY_BATTERY, buf.readUnsignedShortLE());
 
-        // Battery power
-        extendedInfo.set("battery", buf.readUnsignedShort());
-
-        // Temperature
         if (isFormat(format, F10, F20, F30)) {
-            extendedInfo.set("temperature", buf.readShort());
+            position.set(Position.PREFIX_TEMP + 1, buf.readShortLE());
         }
 
         if (isFormat(format, F10, F20, F50, F52)) {
-            extendedInfo.set("adc1", buf.readUnsignedShort());
-            extendedInfo.set("adc2", buf.readUnsignedShort());
+            position.set(Position.PREFIX_ADC + 1, buf.readUnsignedShortLE());
+            position.set(Position.PREFIX_ADC + 2, buf.readUnsignedShortLE());
+        }
+
+        // Impulse counters
+        if (isFormat(format, F20, F50, F51, F52)) {
+            buf.readUnsignedIntLE();
+            buf.readUnsignedIntLE();
         }
 
         if (isFormat(format, F20, F50, F51, F52)) {
-            // Impulse counters
-            buf.readUnsignedInt();
-            buf.readUnsignedInt();
-        }
-
-        if (isFormat(format, F20, F50, F51, F52)) {
-            // Validity
             int locationStatus = buf.readUnsignedByte();
-            position.setValid((locationStatus & 0x02) == 0x02);
+            position.setValid(BitUtil.check(locationStatus, 1));
 
-            // Location time
-            time.clear();
-            time.set(Calendar.HOUR, buf.readUnsignedByte());
-            time.set(Calendar.MINUTE, buf.readUnsignedByte());
-            time.set(Calendar.SECOND, buf.readUnsignedByte());
-            time.set(Calendar.DAY_OF_MONTH, buf.readUnsignedByte());
-            time.set(Calendar.MONTH, buf.readUnsignedByte());
-            time.set(Calendar.YEAR, 2000 + buf.readUnsignedByte());
-            position.setTime(time.getTime());
+            DateBuilder dateBuilder = new DateBuilder()
+                    .setTime(buf.readUnsignedByte(), buf.readUnsignedByte(), buf.readUnsignedByte())
+                    .setDateReverse(buf.readUnsignedByte(), buf.readUnsignedByte() + 1, buf.readUnsignedByte());
+            position.setTime(dateBuilder.getDate());
 
-            // Location data
-            position.setLatitude(buf.readFloat() / Math.PI * 180);
-            position.setLongitude(buf.readFloat() / Math.PI * 180);
-            position.setSpeed((double) buf.readFloat());
-            position.setCourse((double) buf.readUnsignedShort());
+            position.setLatitude(buf.readFloatLE() / Math.PI * 180);
+            position.setLongitude(buf.readFloatLE() / Math.PI * 180);
+            position.setSpeed(UnitsConverter.knotsFromKph(buf.readFloatLE()));
+            position.setCourse(buf.readUnsignedShortLE());
 
-            // Milage
-            extendedInfo.set("milage", buf.readFloat());
-
-            // Last segment
-            extendedInfo.set("segment", buf.readFloat());
+            position.set(Position.KEY_ODOMETER, buf.readFloatLE() * 1000);
+            position.set(Position.KEY_DISTANCE, buf.readFloatLE());
 
             // Segment times
-            buf.readUnsignedShort();
-            buf.readUnsignedShort();
+            buf.readUnsignedShortLE();
+            buf.readUnsignedShortLE();
         }
 
+        // Other
         if (isFormat(format, F51, F52)) {
-            // Other stuff
-            buf.readUnsignedShort();
+            buf.readUnsignedShortLE();
             buf.readByte();
-            buf.readUnsignedShort();
-            buf.readUnsignedShort();
+            buf.readUnsignedShortLE();
+            buf.readUnsignedShortLE();
             buf.readByte();
-            buf.readUnsignedShort();
-            buf.readUnsignedShort();
+            buf.readUnsignedShortLE();
+            buf.readUnsignedShortLE();
             buf.readByte();
-            buf.readUnsignedShort();
+            buf.readUnsignedShortLE();
         }
 
+        // Four temperature sensors
         if (isFormat(format, F40, F52)) {
-            // Four temperature sensors
             buf.readByte();
             buf.readByte();
             buf.readByte();
             buf.readByte();
         }
 
-        // Extended info
-        position.setExtendedInfo(extendedInfo.toString());
-
-        return position;
+        return new ParseResult(index, position);
     }
 
-    private Object processSingle(Channel channel, ChannelBuffer buf) {
-        Position position = parsePosition(buf);
+    private Object processSingle(DeviceSession deviceSession, Channel channel, ByteBuf buf) {
+        ParseResult result = parsePosition(deviceSession, buf);
 
-        ChannelBuffer response = ChannelBuffers.dynamicBuffer(ByteOrder.LITTLE_ENDIAN, 8);
-        response.writeBytes(ChannelBuffers.copiedBuffer(ByteOrder.LITTLE_ENDIAN, "*<T", charset));
-        response.writeInt(position.getId().intValue());
+        ByteBuf response = Unpooled.buffer(8);
+        response.writeCharSequence("*<T", StandardCharsets.US_ASCII);
+        response.writeIntLE((int) result.getId());
         sendReply(channel, response);
 
-        // No location data
-        if (position.getValid() == null) {
+        if (result.getPosition().getFixTime() == null) {
             return null;
         }
 
-        return position;
+        return result.getPosition();
     }
 
-    private Object processArray(Channel channel, ChannelBuffer buf) {
-        List<Position> positions = new LinkedList<Position>();
+    private Object processArray(DeviceSession deviceSession, Channel channel, ByteBuf buf) {
+        List<Position> positions = new LinkedList<>();
         int count = buf.readUnsignedByte();
 
         for (int i = 0; i < count; i++) {
-            Position position = parsePosition(buf);
-            if (position.getValid() != null) {
+            Position position = parsePosition(deviceSession, buf).getPosition();
+            if (position.getFixTime() != null) {
                 positions.add(position);
             }
         }
 
-        ChannelBuffer response = ChannelBuffers.dynamicBuffer(ByteOrder.LITTLE_ENDIAN, 8);
-        response.writeBytes(ChannelBuffers.copiedBuffer(ByteOrder.LITTLE_ENDIAN, "*<A", charset));
+        ByteBuf response = Unpooled.buffer(8);
+        response.writeCharSequence("*<A", StandardCharsets.US_ASCII);
         response.writeByte(count);
         sendReply(channel, response);
 
-        // No location data
         if (positions.isEmpty()) {
             return null;
         }
@@ -238,19 +217,15 @@ public class NavisProtocolDecoder extends BaseProtocolDecoder {
         return positions;
     }
 
-    private Object processHandshake(Channel channel, ChannelBuffer buf) {
+    private Object processHandshake(Channel channel, SocketAddress remoteAddress, ByteBuf buf) {
         buf.readByte(); // semicolon symbol
-        imei = buf.toString(Charset.defaultCharset());
-        try {
-            databaseDeviceId = getDataManager().getDeviceByImei(imei).getId();
-            sendReply(channel, ChannelBuffers.copiedBuffer(ByteOrder.LITTLE_ENDIAN, "*<S", charset));
-        } catch(Exception error) {
-            Log.warning("Unknown device - " + imei);
+        if (getDeviceSession(channel, remoteAddress, buf.toString(StandardCharsets.US_ASCII)) != null) {
+            sendReply(channel, Unpooled.copiedBuffer("*<S", StandardCharsets.US_ASCII));
         }
         return null;
     }
 
-    private static short checksum(ChannelBuffer buf) {
+    private static short checksum(ByteBuf buf) {
         short sum = 0;
         for (int i = 0; i < buf.readableBytes(); i++) {
             sum ^= buf.getUnsignedByte(i);
@@ -258,49 +233,51 @@ public class NavisProtocolDecoder extends BaseProtocolDecoder {
         return sum;
     }
 
-    private void sendReply(Channel channel, ChannelBuffer data) {
-        ChannelBuffer header = ChannelBuffers.directBuffer(ByteOrder.LITTLE_ENDIAN, 16);
-        header.writeBytes(ChannelBuffers.copiedBuffer(ByteOrder.LITTLE_ENDIAN, prefix, charset));
-        header.writeInt((int) deviceId);
-        header.writeInt((int) serverId);
-        header.writeShort(data.readableBytes());
-        header.writeByte(checksum(data));
-        header.writeByte(checksum(header));
-
+    private void sendReply(Channel channel, ByteBuf data) {
         if (channel != null) {
-            channel.write(ChannelBuffers.copiedBuffer(header, data));
+            ByteBuf header = Unpooled.buffer(16);
+            header.writeCharSequence(prefix, StandardCharsets.US_ASCII);
+            header.writeIntLE((int) deviceUniqueId);
+            header.writeIntLE((int) serverId);
+            header.writeShortLE(data.readableBytes());
+            header.writeByte(checksum(data));
+            header.writeByte(checksum(header));
+
+            channel.writeAndFlush(new NetworkMessage(Unpooled.wrappedBuffer(header, data), channel.remoteAddress()));
         }
     }
 
     @Override
     protected Object decode(
-            ChannelHandlerContext ctx, Channel channel, Object msg)
-            throws Exception {
+            Channel channel, SocketAddress remoteAddress, Object msg) throws Exception {
 
-        ChannelBuffer buf = (ChannelBuffer) msg;
+        ByteBuf buf = (ByteBuf) msg;
 
-        // Read header
-        prefix = buf.toString(buf.readerIndex(), 4, charset);
+        prefix = buf.toString(buf.readerIndex(), 4, StandardCharsets.US_ASCII);
         buf.skipBytes(prefix.length()); // prefix @NTC by default
-        serverId = buf.readUnsignedInt();
-        deviceId = buf.readUnsignedInt();
-        int length = buf.readUnsignedShort();
+        serverId = buf.readUnsignedIntLE();
+        deviceUniqueId = buf.readUnsignedIntLE();
+        int length = buf.readUnsignedShortLE();
         buf.skipBytes(2); // header and data XOR checksum
 
         if (length == 0) {
             return null; // keep alive message
         }
 
-        // Read message type
-        String type = buf.toString(buf.readerIndex(), 3, charset);
+        String type = buf.toString(buf.readerIndex(), 3, StandardCharsets.US_ASCII);
         buf.skipBytes(type.length());
 
-        if (type.equals("*>T")) {
-            return processSingle(channel, buf);
-        } else if (type.equals("*>A")) {
-            return processArray(channel, buf);
-        } else if (type.equals("*>S")) {
-            return processHandshake(channel, buf);
+        if (type.equals("*>S")) {
+            return processHandshake(channel, remoteAddress, buf);
+        } else {
+            DeviceSession deviceSession = getDeviceSession(channel, remoteAddress);
+            if (deviceSession != null) {
+                if (type.equals("*>T")) {
+                    return processSingle(deviceSession, channel, buf);
+                } else if (type.equals("*>A")) {
+                    return processArray(deviceSession, channel, buf);
+                }
+            }
         }
 
         return null;

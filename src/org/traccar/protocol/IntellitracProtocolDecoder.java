@@ -1,5 +1,5 @@
 /*
- * Copyright 2013 Anton Tananaev (anton.tananaev@gmail.com)
+ * Copyright 2013 - 2018 Anton Tananaev (anton@traccar.org)
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,112 +15,102 @@
  */
 package org.traccar.protocol;
 
-import java.util.Calendar;
-import java.util.TimeZone;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-import org.jboss.netty.channel.Channel;
-import org.jboss.netty.channel.ChannelHandlerContext;
+import io.netty.channel.Channel;
 import org.traccar.BaseProtocolDecoder;
-import org.traccar.ServerManager;
-import org.traccar.helper.Log;
-import org.traccar.model.ExtendedInfoFormatter;
+import org.traccar.DeviceSession;
+import org.traccar.helper.Parser;
+import org.traccar.helper.PatternBuilder;
 import org.traccar.model.Position;
+
+import java.net.SocketAddress;
+import java.util.regex.Pattern;
 
 public class IntellitracProtocolDecoder extends BaseProtocolDecoder {
 
-    public IntellitracProtocolDecoder(ServerManager serverManager) {
-        super(serverManager);
+    public IntellitracProtocolDecoder(IntellitracProtocol protocol) {
+        super(protocol);
     }
 
-    static private Pattern pattern = Pattern.compile(
-            "(?:.+,)?(\\d+)," +            // Device Identifier
-            "(\\d{4})(\\d{2})(\\d{2})" +   // Date (YYYYMMDD)
-            "(\\d{2})(\\d{2})(\\d{2})," +  // Time (HHMMSS)
-            "(-?\\d+\\.\\d+)," +           // Longitude
-            "(-?\\d+\\.\\d+)," +           // Latitude
-            "(\\d+\\.?\\d*)," +            // Speed
-            "(\\d+\\.?\\d*)," +            // Course
-            "(\\d+\\.?\\d*)," +            // Altitude
-            "(\\d+)," +                    // Satellites
-            "(\\d+)," +                    // Report Identifier
-            "(\\d+)," +                    // Input
-            "(\\d+),?" +                   // Output
-            "(\\d+\\.\\d+)?,?" +           // ADC1
-            "(\\d+\\.\\d+)?");             // ADC2
+    private static final Pattern PATTERN = new PatternBuilder()
+            .expression(".+,").optional()
+            .number("(d+),")                     // identifier
+            .number("(dddd)(dd)(dd)")            // date (yyyymmdd)
+            .number("(dd)(dd)(dd),")             // time (hhmmss)
+            .number("(-?d+.d+),")                // longitude
+            .number("(-?d+.d+),")                // latitude
+            .number("(d+.?d*),")                 // speed
+            .number("(d+.?d*),")                 // course
+            .number("(-?d+.?d*),")               // altitude
+            .number("(d+),")                     // satellites
+            .number("(d+),")                     // index
+            .number("(d+),")                     // input
+            .number("(d+),?")                    // output
+            .number("(d+.d+)?,?")                // adc1
+            .number("(d+.d+)?,?")                // adc2
+            .groupBegin()
+            .number("d{14},d+,")
+            .number("(d+),")                     // vss
+            .number("(d+),")                     // rpm
+            .number("(-?d+),")                   // coolant
+            .number("(d+),")                     // fuel
+            .number("(d+),")                     // fuel consumption
+            .number("(-?d+),")                   // fuel temperature
+            .number("(d+),")                     // charger pressure
+            .number("(d+),")                     // tpl
+            .number("(d+),")                     // axle weight
+            .number("(d+)")                      // odometer
+            .groupEnd("?")
+            .any()
+            .compile();
 
     @Override
     protected Object decode(
-            ChannelHandlerContext ctx, Channel channel, Object msg)
-            throws Exception {
+            Channel channel, SocketAddress remoteAddress, Object msg) throws Exception {
 
-        String sentence = (String) msg;
-        
-        // Parse message
-        Matcher parser = pattern.matcher(sentence);
+        Parser parser = new Parser(PATTERN, (String) msg);
         if (!parser.matches()) {
             return null;
         }
 
-        // Create new position
-        Position position = new Position();
-        ExtendedInfoFormatter extendedInfo = new ExtendedInfoFormatter("intellitrac");
-        Integer index = 1;
+        Position position = new Position(getProtocolName());
 
-        // Detect device
-        String id = parser.group(index++);
-        try {
-            position.setDeviceId(getDataManager().getDeviceByImei(id).getId());
-        } catch(Exception error) {
-            Log.warning("Unknown device - " + id);
+        DeviceSession deviceSession = getDeviceSession(channel, remoteAddress, parser.next());
+        if (deviceSession == null) {
             return null;
         }
-        
-        // Date and time
-        Calendar time = Calendar.getInstance(TimeZone.getTimeZone("UTC"));
-        time.clear();
-        time.set(Calendar.YEAR, Integer.valueOf(parser.group(index++)));
-        time.set(Calendar.MONTH, Integer.valueOf(parser.group(index++)) - 1);
-        time.set(Calendar.DAY_OF_MONTH, Integer.valueOf(parser.group(index++)));
-        time.set(Calendar.HOUR, Integer.valueOf(parser.group(index++)));
-        time.set(Calendar.MINUTE, Integer.valueOf(parser.group(index++)));
-        time.set(Calendar.SECOND, Integer.valueOf(parser.group(index++)));
-        position.setTime(time.getTime());
-        
-        // Location data
-        position.setLongitude(Double.valueOf(parser.group(index++)));
-        position.setLatitude(Double.valueOf(parser.group(index++)));
-        position.setSpeed(Double.valueOf(parser.group(index++)));
-        position.setCourse(Double.valueOf(parser.group(index++)));
-        position.setAltitude(Double.valueOf(parser.group(index++)));
-        
-        // Satellites
-        int satellites = Integer.valueOf(parser.group(index++));
+        position.setDeviceId(deviceSession.getDeviceId());
+
+        position.setTime(parser.nextDateTime());
+
+        position.setLongitude(parser.nextDouble(0));
+        position.setLatitude(parser.nextDouble(0));
+        position.setSpeed(parser.nextDouble(0));
+        position.setCourse(parser.nextDouble(0));
+        position.setAltitude(parser.nextDouble(0));
+
+        int satellites = parser.nextInt(0);
         position.setValid(satellites >= 3);
-        extendedInfo.set("satellites", satellites);
-        
-        // Report identifier
-        position.setId(Long.valueOf(parser.group(index++)));
+        position.set(Position.KEY_SATELLITES, satellites);
 
-        // Input
-        extendedInfo.set("input", parser.group(index++));
+        position.set(Position.KEY_INDEX, parser.nextLong(0));
+        position.set(Position.KEY_INPUT, parser.nextInt(0));
+        position.set(Position.KEY_OUTPUT, parser.nextInt(0));
 
-        // Output
-        extendedInfo.set("output", parser.group(index++));
+        position.set(Position.PREFIX_ADC + 1, parser.nextDouble(0));
+        position.set(Position.PREFIX_ADC + 2, parser.nextDouble(0));
 
-        // ADC1
-        String adc1 = parser.group(index++);
-        if (adc1 != null) {
-            extendedInfo.set("adc1", adc1);
-        }
+        // J1939 data
+        position.set(Position.KEY_OBD_SPEED, parser.nextInt(0));
+        position.set(Position.KEY_RPM, parser.nextInt(0));
+        position.set("coolant", parser.nextInt(0));
+        position.set(Position.KEY_FUEL_LEVEL, parser.nextInt(0));
+        position.set(Position.KEY_FUEL_CONSUMPTION, parser.nextInt(0));
+        position.set(Position.PREFIX_TEMP + 1, parser.nextInt(0));
+        position.set("chargerPressure", parser.nextInt(0));
+        position.set("tpl", parser.nextInt(0));
+        position.set(Position.KEY_AXLE_WEIGHT, parser.nextInt(0));
+        position.set(Position.KEY_OBD_ODOMETER, parser.nextInt(0));
 
-        // ADC2
-        String adc2 = parser.group(index++);
-        if (adc2 != null) {
-            extendedInfo.set("adc2", adc2);
-        }
-
-        position.setExtendedInfo(extendedInfo.toString());
         return position;
     }
 

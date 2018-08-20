@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Anton Tananaev (anton.tananaev@gmail.com)
+ * Copyright 2012 Anton Tananaev (anton@traccar.org)
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,30 +15,28 @@
  */
 package org.traccar;
 
-import org.jboss.netty.util.HashedWheelTimer;
-import org.jboss.netty.util.Timer;
+import io.netty.util.HashedWheelTimer;
+import io.netty.util.Timer;
 
-/**
- * Global idle timer
- */
-public class GlobalTimer {
+public final class GlobalTimer {
 
     private static Timer instance = null;
 
     private GlobalTimer() {
     }
-    
+
     public static void release() {
         if (instance != null) {
             instance.stop();
         }
         instance = null;
     }
-    
+
     public static Timer getTimer() {
-        if(instance == null) {
+        if (instance == null) {
             instance = new HashedWheelTimer();
         }
         return instance;
     }
+
 }
